@@ -22,7 +22,7 @@ RUN apt-get update \
 
 # 👇 RUST INSTALL
 # -----------------------------------------
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain nightly
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain nightly-2026-03-19
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # 👇 PATHMAP INSTALL
