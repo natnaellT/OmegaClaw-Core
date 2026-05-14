@@ -14,6 +14,11 @@
     "- Search the web: (search string_in_quotes)"
     "- Search the web using the Tavily Search Agent: (tavily-search string_in_quotes)"
     "- Get technical analysis for a stock ticker using the Technical Analysis Agent: (technical-analysis ticker_in_quotes)"
+   ;BIOLOGICAL ANNOTATION GRAPH:
+   "- Index bio output folder (default output): (bio-index) or (bio-index output_dir_in_quotes)"
+   "- Force-refresh bio output folder index: (bio-reindex) or (bio-reindex output_dir_in_quotes)"
+   "- Query indexed bio atoms with commands stats|folders|predicates|entity ID|node TYPE ID|predicate NAME|folder REL|neighbors ID|neighbors TYPE ID: (bio-query query_in_quotes)"
+   "- Query indexed bio atoms in a custom output folder: (bio-query-in output_dir_in_quotes query_in_quotes)"
     ;CODE EXECUTION:
     "- Execute MeTTa expression: (metta sexpression)"
     "Example to invoke Non-Axiomatic Logic via MeTTa: "
@@ -52,6 +57,24 @@
 
 (= (technical-analysis $ticker)
    (py-call (agentverse.technical_analysis $ticker)))
+
+(= (bio-index)
+   (py-call (bio_graph.bio_index)))
+
+(= (bio-index $output_dir)
+   (py-call (bio_graph.bio_index $output_dir)))
+
+(= (bio-reindex)
+   (py-call (bio_graph.bio_reindex)))
+
+(= (bio-reindex $output_dir)
+   (py-call (bio_graph.bio_reindex $output_dir)))
+
+(= (bio-query $query)
+   (py-call (bio_graph.bio_query $query)))
+
+(= (bio-query-in $output_dir $query)
+   (py-call (bio_graph.bio_query_in $output_dir $query)))
 
 !(import_prolog_functions_from_file (library OmegaClaw-Core ./src/skills.pl) (shell first_char))
 

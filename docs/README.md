@@ -52,6 +52,7 @@ User-facing MeTTa skills the agent invokes. Each page follows the template **Sig
 - [reference-skills-memory.md](./reference-skills-memory.md) — `remember`, `query`, `episodes`, `pin`
 - [reference-skills-io.md](./reference-skills-io.md) — `shell`, `read-file`, `write-file`, `append-file`
 - [reference-skills-communication.md](./reference-skills-communication.md) — `send`, `receive`, `search`
+- [reference-skills-bio.md](./reference-skills-bio.md) — `bio-index`, `bio-reindex`, `bio-query`, `bio-query-in`
 - [reference-skills-reasoning.md](./reference-skills-reasoning.md) — `metta` (NAL/PLN invocation surface)
 - [reference-skills-remote-agents.md](./reference-skills-remote-agents.md) — `tavily-search`, `technical-analysis`
 
@@ -60,6 +61,7 @@ User-facing MeTTa skills the agent invokes. Each page follows the template **Sig
 - [reference-configuration.md](./reference-configuration.md) — `configure` form and all runtime parameters
 - [reference-channels.md](./reference-channels.md) — IRC, Mattermost, websearch adapters and the channel contract
 - [reference-python-bridges.md](./reference-python-bridges.md) — `lib_llm_ext.py`, `src/agentverse.py`, `src/helper.py`, `src/skills.pl`
+- [reference-integration-biocypher-omegaclaw.md](./reference-integration-biocypher-omegaclaw.md) — handover for BioCypher KG interoperability and smoke tests
 
 ### Internals
 
