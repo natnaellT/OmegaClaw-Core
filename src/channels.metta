@@ -14,7 +14,7 @@
 ;Connect all the channels:
 (= (initChannels)
    (progn (println! "Initializing channels")
-          (configure commchannel irc)
+          (configure commchannel telegram)
           (if (== (commchannel) irc)
               (progn (configure IRC_channel ##omegaclaw)
                      (configure IRC_server "irc.quakenet.org")
