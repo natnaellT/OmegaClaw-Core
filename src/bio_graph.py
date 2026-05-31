@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
+import shutil
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Sequence, Set, Tuple, Union
@@ -35,6 +38,11 @@ class BioIndex:
 
 
 _CACHE: Dict[str, BioIndex] = {}
+
+# Per-file parsed cache for hot queries
+_PARSE_CACHE: Dict[str, Dict] = {}
+# Maximum number of cached files to keep in memory
+MAX_CACHED_FILES = 256
 
 
 def _normalize_entity_type(entity_type: str) -> str:
@@ -475,6 +483,256 @@ def _dispatch_query(index: BioIndex, query: str) -> str:
         return _query_neighbors(index, args)
 
     return f"unknown command: {command}\n{_help_text()}"
+
+
+def _evict_if_needed() -> None:
+    if len(_PARSE_CACHE) <= MAX_CACHED_FILES:
+        return
+    # evict least recently used
+    oldest = None
+    for path, entry in _PARSE_CACHE.items():
+        if oldest is None or entry.get("last_used", 0) < _PARSE_CACHE[oldest].get("last_used", 0):
+            oldest = path
+    if oldest:
+        del _PARSE_CACHE[oldest]
+
+
+def _file_specs_map(root: str) -> Dict[str, Tuple[str, str]]:
+    out: Dict[str, Tuple[str, str]] = {}
+    for file_path, relation_group, file_kind in _walk_metta_files(root):
+        out[os.path.abspath(file_path)] = (relation_group, file_kind)
+    return out
+
+
+def _parse_file_atoms(file_path: str, relation_group: str, file_kind: str) -> List[AtomRecord]:
+    atoms: List[AtomRecord] = []
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
+            content = _strip_line_comments(handle.read())
+    except OSError:
+        return atoms
+
+    line = 1
+    for atom_raw, start_line in _iter_top_level_atoms(content):
+        try:
+            parsed = _parse_atom(atom_raw)
+        except ValueError:
+            continue
+
+        if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], str):
+            continue
+
+        head = parsed[0]
+        entities: Set[Tuple[str, str]] = set()
+        _collect_entities(parsed, entities)
+        sorted_entities = sorted(entities)
+
+        record = AtomRecord(
+            atom_id=len(atoms),
+            relation_group=relation_group,
+            file_kind=file_kind,
+            file_path=file_path,
+            line=start_line,
+            raw=atom_raw,
+            head=head,
+            entities=sorted_entities,
+        )
+        atoms.append(record)
+
+    return atoms
+
+
+def _get_parsed_file(root: str, file_path: str, specs_map: Dict[str, Tuple[str, str]]) -> List[AtomRecord]:
+    abs_path = os.path.abspath(file_path)
+    try:
+        stat = os.stat(abs_path)
+        sig = (int(stat.st_mtime), int(stat.st_size))
+    except OSError:
+        return []
+
+    entry = _PARSE_CACHE.get(abs_path)
+    if entry and entry.get("signature") == sig:
+        entry["last_used"] = time.time()
+        return entry.get("atoms", [])
+
+    # parse file
+    relation_group, file_kind = specs_map.get(abs_path, ("_root", os.path.splitext(os.path.basename(abs_path))[0].lower()))
+    atoms = _parse_file_atoms(abs_path, relation_group, file_kind)
+    _PARSE_CACHE[abs_path] = {"signature": sig, "atoms": atoms, "last_used": time.time()}
+    _evict_if_needed()
+    return atoms
+
+
+def _find_candidate_files(root: str, token: str) -> List[str]:
+    root_abs = os.path.abspath(root)
+    token = token.strip()
+    results: List[str] = []
+    # Use ripgrep if available for speed
+    try:
+        if shutil.which("rg"):
+            proc = subprocess.run(["rg", "-l", "-F", token, "--glob", "*.metta", root_abs], capture_output=True, text=True, timeout=30)
+            if proc.returncode in (0, 1):
+                for line in proc.stdout.splitlines():
+                    if line:
+                        results.append(os.path.abspath(line.strip()))
+                if results:
+                    return results
+    except Exception:
+        pass
+
+    # Fallback: scan files for token
+    for file_path, _, _ in _walk_metta_files(root_abs):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+                data = fh.read()
+                if token in data:
+                    results.append(os.path.abspath(file_path))
+        except OSError:
+            continue
+
+    return results
+
+
+def bio_query_hot(query: str, output_root: str = "output") -> str:
+    """On-demand hot query: parse only files required to answer the query."""
+    try:
+        root = os.path.abspath(output_root)
+        # build file spec map for metadata
+        specs_map = _file_specs_map(root)
+    except Exception as exc:  # noqa: BLE001
+        return f"bio_query_hot error: {exc}"
+
+    try:
+        parts = shlex.split(query)
+    except Exception as exc:
+        return f"query parse error: {exc}"
+
+    if not parts:
+        return _help_text()
+
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd == "help":
+        return _help_text()
+    if cmd == "stats":
+        # cheap summary: count files and atoms by scanning file headers lightly
+        total_files = 0
+        total_atoms = 0
+        for file_path, _, _ in _walk_metta_files(root):
+            total_files += 1
+            atoms = _get_parsed_file(root, file_path, specs_map)
+            total_atoms += len(atoms)
+        return f"indexed root={root} files={total_files} atoms={total_atoms}"
+    if cmd == "folders":
+        counts = defaultdict(int)
+        for file_path, relation_group, _ in _walk_metta_files(root):
+            counts[relation_group] += 1
+        return "\n".join(f"{k} atoms={v}" for k, v in sorted(counts.items(), key=lambda i: (-i[1], i[0])))
+    if cmd in ("entity", "node"):
+        typed = cmd == "node"
+        if typed and len(args) < 2:
+            return "usage: node <entity_type> <entity_id>"
+        if not typed and not args:
+            return "usage: entity <entity_id>"
+
+        if typed:
+            entity_type = _normalize_entity_type(args[0])
+            entity_id = _normalize_entity_id(args[1])
+            token = entity_id
+        else:
+            entity_id = _normalize_entity_id(args[0])
+            token = entity_id
+
+        candidates = _find_candidate_files(root, token)
+        ids: List[int] = []
+        matches: List[AtomRecord] = []
+        for file_path in candidates:
+            atoms = _get_parsed_file(root, file_path, specs_map)
+            for rec in atoms:
+                for etype, eid in rec.entities:
+                    if _normalize_entity_id(eid) == entity_id and (not typed or _normalize_entity_type(etype) == entity_type):
+                        matches.append(rec)
+        if not matches:
+            return "no matches"
+        # format like _format_records
+        lines = [f"matches={len(matches)} showing={min(20,len(matches))}"]
+        for rec in matches[:20]:
+            rel_path = os.path.relpath(rec.file_path, root)
+            lines.append(f"[{rec.relation_group}/{rec.file_kind}] {rel_path}:{rec.line} {rec.raw}")
+        if len(matches) > 20:
+            lines.append(f"... truncated {len(matches)-20} more")
+        return "\n".join(lines)
+
+    if cmd == "predicate":
+        if not args:
+            return "usage: predicate <name>"
+        pred = args[0]
+        candidates = _find_candidate_files(root, pred)
+        matches: List[AtomRecord] = []
+        for file_path in candidates:
+            atoms = _get_parsed_file(root, file_path, specs_map)
+            for rec in atoms:
+                if rec.head == pred:
+                    matches.append(rec)
+        return _format_records(BioIndex(root, (0,0,0), files_scanned=0), [i for i in range(len(matches))], limit=20) if False else ("\n".join([f"matches={len(matches)} showing={min(20,len(matches))}"] + [f"[{m.relation_group}/{m.file_kind}] {os.path.relpath(m.file_path, root)}:{m.line} {m.raw}" for m in matches[:20]]))
+
+    if cmd == "folder":
+        if not args:
+            return "usage: folder <relation_group>"
+        rg = args[0]
+        matches: List[AtomRecord] = []
+        for file_path, relation_group, _ in _walk_metta_files(root):
+            if relation_group == rg:
+                atoms = _get_parsed_file(root, file_path, specs_map)
+                matches.extend(atoms)
+        return _format_records(BioIndex(root, (0,0,0), files_scanned=0), [i for i in range(len(matches))], limit=20) if False else ("\n".join([f"matches={len(matches)} showing={min(20,len(matches))}"] + [f"[{m.relation_group}/{m.file_kind}] {os.path.relpath(m.file_path, root)}:{m.line} {m.raw}" for m in matches[:20]]))
+
+    if cmd == "neighbors":
+        # neighbors requires scanning candidate files for the entity and aggregating
+        if not args:
+            return "usage: neighbors <entity_id> OR neighbors <entity_type> <entity_id>"
+        typed = len(args) >= 2
+        if typed:
+            target = (_normalize_entity_type(args[0]), _normalize_entity_id(args[1]))
+            token = args[1]
+        else:
+            target_id = _normalize_entity_id(args[0])
+            token = args[0]
+
+        candidates = _find_candidate_files(root, token)
+        neighbor_counts: Counter[Tuple[str, str]] = Counter()
+        supporting_predicates: Dict[Tuple[str, str], Counter[str]] = defaultdict(Counter)
+        from_atoms = 0
+        for file_path in candidates:
+            atoms = _get_parsed_file(root, file_path, specs_map)
+            for rec in atoms:
+                entities_norm = [(_normalize_entity_type(t), _normalize_entity_id(i)) for t, i in rec.entities]
+                if typed:
+                    if target not in entities_norm:
+                        continue
+                else:
+                    if not any(i == _normalize_entity_id(token) for _, i in entities_norm):
+                        continue
+                from_atoms += 1
+                for (etype, eid), raw in zip(entities_norm, rec.entities):
+                    if (etype, eid) == (target if typed else (etype, _normalize_entity_id(token))):
+                        continue
+                    neighbor_counts[raw] += 1
+                    supporting_predicates[raw][rec.head] += 1
+
+        if not neighbor_counts:
+            return "no neighbor entities found"
+
+        lines = [f"neighbors={len(neighbor_counts)} from_atoms={from_atoms} showing={min(20,len(neighbor_counts))}"]
+        for (entity_type, entity_id), count in neighbor_counts.most_common(20):
+            top_predicates = supporting_predicates[(entity_type, entity_id)].most_common(3)
+            pred_text = ", ".join(f"{name}:{n}" for name, n in top_predicates)
+            lines.append(f"{entity_type} {entity_id} count={count} via={pred_text}")
+
+        return "\n".join(lines)
+
+    return f"unknown command: {cmd}\n{_help_text()}"
 
 
 def bio_index(output_root: str = "output") -> str:

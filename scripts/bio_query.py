@@ -80,6 +80,11 @@ def main() -> int:
         help="Start interactive query mode",
     )
     parser.add_argument(
+        "--hot",
+        action="store_true",
+        help="Use hot on-demand querying (no full index)",
+    )
+    parser.add_argument(
         "query",
         nargs="*",
         help="Query command words, e.g. stats or node gene ENSG...",
@@ -103,7 +108,10 @@ def main() -> int:
 
     if args.query:
         query_text = " ".join(args.query)
-        print(bg.bio_query_in(root, query_text))
+        if args.hot:
+            print(bg.bio_query_hot(query_text, root))
+        else:
+            print(bg.bio_query_in(root, query_text))
         return 0
 
     if args.repl:
@@ -123,7 +131,10 @@ def main() -> int:
             if raw == ":reindex":
                 print(bg.bio_reindex(root))
                 continue
-            print(bg.bio_query_in(root, raw))
+            if args.hot:
+                print(bg.bio_query_hot(raw, root))
+            else:
+                print(bg.bio_query_in(root, raw))
         
     parser.print_help()
     return 0

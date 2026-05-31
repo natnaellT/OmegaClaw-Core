@@ -16,6 +16,9 @@
     "- Get technical analysis for a stock ticker using the Technical Analysis Agent: technical-analysis ticker"
     ;CODE EXECUTION:
     "- Execute MeTTa expression: metta sexpression"
+   "- Query BioCypher MeTTa exports: bio-query \"command\""
+   "- Query a specific output root: bio-query-in \"output_root\" \"command\""
+   "- Hot on-demand queries (no full index): bio-query-hot \"command\""
     "Example to invoke Non-Axiomatic Logic via MeTTa: "
     "metta (|- ((--> (× sam garfield) friend) (stv 1.0 0.9))"
     "          ((--> garfield animal) (stv 1.0 0.9)))"
@@ -53,6 +56,22 @@
 
 (= (technical-analysis $ticker)
    (py-call (agentverse.technical_analysis $ticker)))
+
+
+(= (bio-index $root)
+   (py-call (bio_graph.bio_index $root)))
+
+(= (bio-reindex $root)
+   (py-call (bio_graph.bio_reindex $root)))
+
+(= (bio-query $q)
+   (py-call (bio_graph.bio_query $q)))
+
+(= (bio-query-in $root $q)
+   (py-call (bio_graph.bio_query_in $root $q)))
+
+(= (bio-query-hot $q)
+   (py-call (bio_graph.bio_query_hot $q)))
 
 !(import_prolog_functions_from_file (library OmegaClaw-Core ./src/skills.pl) (shell first_char gc read_file_tail))
 

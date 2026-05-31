@@ -21,7 +21,7 @@ def _add_src_to_path() -> None:
 
 
 def _find_first_entity_id(root: Path, entity_type: str) -> Optional[str]:
-    # Match tuple-like terms such as: (gene ENSG00000101349)
+    # Match MeTTa terms such as: (gene ENSG00000101349)
     pattern = re.compile(r"\(" + re.escape(entity_type) + r"\s+([^\s\)]+)\)")
     for metta_file in sorted(root.rglob("*.metta")):
         try:
