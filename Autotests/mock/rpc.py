@@ -1,12 +1,10 @@
 import logging
 import threading
 import select
-import pickle
 import socket
 import json
 
-HOST_DEFAULT = "localhost"
-PORT_DEFAULT = 9765
+LOCALHOST = "localhost"
 
 class Shared:
 
@@ -26,26 +24,6 @@ class Shared:
     def map(self, f):
         with self._lock:
             self._value = f(self._value)
-
-class Queue:
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._queue = []
-
-    def push_back(self, item):
-        with self._lock:
-            self._queue.append(item)
-
-    def front(self):
-        with self._lock:
-            if len(self._queue) == 0:
-                return None
-            return self._queue[0]
-
-    def pop_front(self):
-        with self._lock:
-            return self._queue.pop(0)
 
 class RingBuffer:
 
@@ -217,14 +195,14 @@ class ConnectionTransport:
     def _write_msg(self, data):
         logging.debug(f'Writing message: {data}')
         size = len(data)
-        assert self._output.write_blocking(int(size).to_bytes(4) + data)
+        assert self._output.write_blocking(int(size).to_bytes(4, 'big') + data)
         logging.debug(f'Message is written')
 
     def _read_msg(self):
         data = self._input.read_aot(4)
         if not data:
             return None
-        size = int.from_bytes(data)
+        size = int.from_bytes(data, 'big')
         logging.debug(f'Reading {size} bytes message')
         data = self._input.read_aot(4 + size)
         if not data:
@@ -339,7 +317,7 @@ class ConnectionTransport:
 
 class IPCServer:
 
-    def __init__(self, address=(HOST_DEFAULT, PORT_DEFAULT)):
+    def __init__(self, address):
         self._server = socket.create_server(address)
         self._server.setblocking(False)
         self._address = address
@@ -370,7 +348,7 @@ class IPCServer:
 
 class IPCClient():
 
-    def __init__(self, address=(HOST_DEFAULT, PORT_DEFAULT)):
+    def __init__(self, address):
         self._address = address
         self._transport = ConnectionTransport(lambda: self._connect())
 

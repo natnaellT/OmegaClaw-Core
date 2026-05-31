@@ -6,8 +6,6 @@ Run:
 """
 import time
 
-import mock.rpc as rpc
-from mock.llm import llm_mock_controller
 
 from helpers import (
     Checker, dexec, make_prompt, send_prompt, wait_for_file,
@@ -18,15 +16,15 @@ TARGET_FILE = "/tmp/testcat/hello.txt"
 WAIT = 30
 
 
-def test_hello_file():
-    with Checker("create hello.txt", cleanup_dirs=[TARGET_DIR]) as c, llm_mock_controller(("0.0.0.0", rpc.PORT_DEFAULT)) as llm:
+def test_hello_file(llm, comm):
+    with Checker("create hello.txt", cleanup_dirs=[TARGET_DIR]) as c:
         print(f"\n=== OmegaClaw smoke test (run-id {c.run_id}) ===", flush=True)
 
         c.verify_clean()
 
         start_ts = int(time.time()) - 1
 
-        c.step("connect to IRC and send prompt")
+        c.step("send prompt via comm channel")
         prompt = make_prompt(
             c.run_id,
             f"Please overwrite {TARGET_FILE} so it contains exactly the single "
@@ -34,9 +32,9 @@ def test_hello_file():
         )
         llm.set_answer(prompt, f'(shell "mkdir -p /tmp/testcat") (write-file "/tmp/testcat/hello.txt" "Hello")')
 
-        if not send_prompt(prompt):
-            c.fail("irc", "could not deliver prompt within 60s")
-        c.ok("irc", f"prompt delivered, run-id={c.run_id}")
+        if not comm.send_message(prompt):
+            c.fail("comm", "could not deliver prompt within 60s")
+        c.ok("comm", f"prompt delivered, run-id={c.run_id}")
 
         c.step(f"wait for {TARGET_FILE} (timeout {WAIT}s)")
         file_mtime = wait_for_file(TARGET_FILE, start_ts, timeout=WAIT)

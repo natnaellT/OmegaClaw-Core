@@ -1,9 +1,9 @@
 import pytest
 
 from llm import *
-from rpc import HOST_DEFAULT
+from rpc import LOCALHOST
 
-TEST_ADDRESS = (HOST_DEFAULT, 9767)
+TEST_ADDRESS = (LOCALHOST, 9767)
 
 class TestLlmMock:
 
@@ -51,3 +51,16 @@ class TestLlmMock:
     def test_no_message(self, agent, controller):
         assert controller.set_answer("hello", "world")
         assert agent.chat(":-:-:-:DO NOT RE-SEND OR SPAM!") == ""
+
+    def test_context_manager(self, agent):
+        with llm_mock_controller(address=TEST_ADDRESS) as controller:
+            assert controller.set_answer("hello", "world")
+            assert agent.chat(":-:-:-:['HUMAN-MSG', 'test: hello']") == "world"
+
+    def test_context_manager_timeout(self, agent):
+        address = (TEST_ADDRESS[0], TEST_ADDRESS[1] + 1)
+        try:
+            with llm_mock_controller(address=address, timeout=2) as controller:
+                assert False
+        except RuntimeError as e:
+            assert e.args == ("Agent didn't answered in 2 seconds",)
