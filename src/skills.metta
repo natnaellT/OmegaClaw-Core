@@ -16,6 +16,17 @@
     "- Get technical analysis for a stock ticker using the Technical Analysis Agent: technical-analysis ticker"
     ;CODE EXECUTION:
     "- Execute MeTTa expression: metta sexpression"
+    "Example to invoke Non-Axiomatic Logic via MeTTa: "
+    "metta (|- ((--> (× sam garfield) friend) (stv 1.0 0.9))"
+    "          ((--> garfield animal) (stv 1.0 0.9)))"
+    "metta (|- ((==> (--> (× $1 elephant) eat) (--> $1 ([] dangerous))) (stv 1.0 0.9))"
+    "          ((--> (× tiger elephant) eat) (stv 1.0 0.9)))"
+    "Also: note the $1 for independent variables, and for negated knowledge use (stv 0.0 0.9)"
+    "Additionally |- also works for revision, to merge evidence even when the term of both premises is the same."
+    "You can also use PLN:"
+    "metta (|~ ((Implication (Inheritance $1 (IntSet Feathered))"
+    "           (Inheritance $1 Bird)) (stv 1.0 0.9))"
+    "          ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"))
     ;BIO ATOMSPACE (BioCypher MeTTa exports):
     "- Index BioCypher output folder (build or reuse cache): bio-index \"output_root\""
     "- Force rebuild index from files: bio-reindex \"output_root\""
@@ -31,12 +42,6 @@
     "  2. Take the returned MeTTa atoms, inject into metta skill with an inference rule:"
     "     metta (|- (transcribes_to (gene ENSG00000125863) (transcript ENST0000353224))"
     "               (Inheritance ENSG00000125863 protein-coding-gene))"
-    "Also: note the $1 for independent variables, and for negated knowledge use (stv 0.0 0.9)"
-    "Example NAL: metta (|- ((-->  (× sam garfield) friend) (stv 1.0 0.9))"
-    "                       ((-->  garfield animal) (stv 1.0 0.9)))"
-    "Example PLN: metta (|~ ((Implication (Inheritance $1 (IntSet Feathered))"
-    "                        (Inheritance $1 Bird)) (stv 1.0 0.9))"
-    "                       ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"))
 
 
 (= (read-file $file)
