@@ -1,162 +1,218 @@
-# Reference - Biological Graph Skills
+# Bio-Claw — BioCypher Atomspace Integration
 
-These skills provide a generalized index/query layer for biological annotations stored as MeTTa atoms in folder-per-relation datasets.
-
-Implementation is backed by `src/bio_graph.py` and exposed through `src/skills.metta`.
+OmegaClaw can consume BioCypher MeTTa exports and reason over them using
+PLN / NAL. The integration is file-based: OmegaClaw reads `.metta` files
+directly with no runtime dependency on BioCypher.
 
 ---
 
-## Expected folder layout
-
-The default root is `output/`.
+## Expected Output Layout
 
 ```text
-output/
+output_root/
   gene/
     nodes.metta
     edges.metta
-  coexpressed/
+  transcript/
     nodes.metta
     edges.metta
-  pathway/
-    nodes.metta
+  coexpressed/
     edges.metta
   ...
 ```
 
-Notes:
-
-- Each first-level directory under `output/` is treated as a relation group.
-- Any `.metta` file is indexed (`nodes.metta`, `edges.metta`, and additional files if present).
-- Missing `nodes.metta` or `edges.metta` files are tolerated.
+- Every first-level subdirectory is a **relation group**.
+- Any `.metta` file is indexed.
+- Files at the root level go into the `_root` group.
 
 ---
 
-## Parsing model
+## Parsing Model
 
-Every top-level s-expression is indexed as one atom record with:
+Every top-level s-expression in a `.metta` file becomes one **Atom** in the
+index. The parser extracts:
 
-- relation group (folder name under `output/`)
-- file kind (basename without extension, for example `nodes` or `edges`)
-- file path + line number
-- predicate (head symbol)
-- extracted entities from nested `(type id)` terms
+| Field           | Example                              |
+|-----------------|--------------------------------------|
+| `relation_group`| `gene` (folder name)                 |
+| `file_kind`     | `nodes`, `edges`                     |
+| `head`          | `transcribes_to` (leading symbol)    |
+| `entities`      | `[("gene","ENSG..."),("transcript","ENST...")]` |
 
-Examples:
+**Example source atom:**
 
 ```metta
-(transcribes_to (gene ENSG00000101349) (transcript ENST00000353224))
-(source (transcribes_to (gene ENSG00000101349) (transcript ENST00000353224)) GENCODE)
-(source_url (transcribes_to (gene ENSG00000101349) (transcript ENST00000353224)) https://www.gencodegenes.org/)
+(transcribes_to (gene ENSG00000125863) (transcript ENST00000353224))
 ```
 
-### Hyperedges
+The parser walks the parse tree recursively. A `(type id)` pair where both
+children are string tokens is an entity. In the example above it finds:
 
-Hyperedges are supported implicitly: any atom containing more than two extracted entities is treated as an n-ary relationship. Neighbor queries include all co-occurring entities in such atoms.
+- `("gene", "ENSG00000125863")`
+- `("transcript", "ENST00000353224")`
+
+These are indexed by `(type, id)` pair **and** by `id` alone so lookups work
+with or without knowing the type.
 
 ---
 
-## `bio-index`
+## Skills Reference
 
-### Signature
+All bio skills take an explicit `output_root` as first argument.
 
-```metta
-(bio-index)
-(bio-index "output_root")
+### `bio-index "output_root"`
+
+Build (or reuse by signature) the full in-memory index.
+
+Returns a summary line:
 ```
-
-### Purpose
-
-Build or reuse an in-memory index for the target output folder.
-
-### Returns
-
-A summary string:
-
-```text
 indexed root=... files=... atoms=... relations=... predicates=... parse_errors=...
 ```
 
----
+### `bio-reindex "output_root"`
 
-## `bio-reindex`
+Force-rebuild the index even if the signature has not changed (e.g. after
+a partial file update that kept the same mtime).
 
-### Signature
+### `bio-query "output_root" "command"`
 
-```metta
-(bio-reindex)
-(bio-reindex "output_root")
-```
+Structured query against the full index. Returns human-readable text.
 
-### Purpose
+**Commands:**
 
-Force-refresh the index even when cached data exists.
+| Command                        | Description                                          |
+|--------------------------------|------------------------------------------------------|
+| `stats`                        | Index summary + top 10 relations and predicates      |
+| `folders`                      | All relation groups with atom counts                 |
+| `predicates`                   | All predicate heads with atom counts                 |
+| `folder <group>`               | All atoms in a relation group                        |
+| `predicate <name>`             | All atoms with this predicate head                   |
+| `node <type> <id>`             | Atoms containing `(type id)` entity pair             |
+| `entity <id>`                  | Atoms containing `id` (any type)                     |
+| `help`                         | Print command reference                              |
 
----
+### `bio-extract "output_root" "command"`
 
-## `bio-query`
-
-### Signature
-
-```metta
-(bio-query "command")
-```
-
-Queries the default `output/` index.
-
-## `bio-query-in`
-
-### Signature
+Same query commands as `bio-query`, but returns **raw MeTTa s-expressions**
+(one atom per line) instead of formatted text. Use this when you want to feed
+the result into the `metta` skill for symbolic inference.
 
 ```metta
-(bio-query-in "output_root" "command")
+; Agent calls:
+(bio-extract "/data/output" "node gene ENSG00000125863")
+
+; Returns something like:
+(transcribes_to (gene ENSG00000125863) (transcript ENST00000353224))
+(source (transcribes_to (gene ENSG00000125863) (transcript ENST00000353224)) GENCODE)
 ```
 
-Queries a specific output folder.
+### `bio-path "output_root" "src_id" "dst_id"`
 
----
+BFS shortest path between two biological entity IDs across the atomspace.
 
-## Query commands
-
-Important: these are **query strings** passed to `bio-query` / `bio-query-in`, not shell commands. For example, run `(bio-query "stats")`, not `stats` in Bash.
+Returns raw MeTTa atoms connecting the path with a header comment:
 
 ```text
-stats
-folders
-predicates
-entity <entity_id>
-node <entity_type> <entity_id>
-predicate <name>
-folder <relation_group>
-neighbors <entity_id>
-neighbors <entity_type> <entity_id>
-help
+; bio-path ENSG00000125863 -> CHEBI:15422  hops=3  via=ENSG... -> ENST... -> P12345 -> CHEBI:15422
+(transcribes_to (gene ENSG00000125863) (transcript ENST00000353224))
+(translates_to (transcript ENST00000353224) (protein P12345))
+(catalyzes (protein P12345) (metabolite CHEBI:15422))
 ```
 
-### Examples
+---
+
+## Neuro-Symbolic Reasoning Chain (Bio-Claw)
+
+```
+bio-index  →  bio-extract / bio-path  →  metta (PLN/NAL)  →  send answer
+```
+
+**Step by step:**
 
 ```metta
-(bio-index "output")
-(bio-query "stats")
-(bio-query "folder gene")
-(bio-query "predicate transcribes_to")
-(bio-query "entity ENSG00000101349")
-(bio-query "node transcript ENST00000353224")
-(bio-query "neighbors gene ENSG00000101349")
+; 1. Index once at startup
+(bio-index "/data/output")
+
+; 2. Extract subgraph around a gene of interest
+;    Result is raw MeTTa atoms stored in LAST_SKILL_USE_RESULTS
+(bio-extract "/data/output" "node gene ENSG00000125863")
+
+; 3. Or find a path between entities
+(bio-path "/data/output" "ENSG00000125863" "CHEBI:15422")
+
+; 4. Inject retrieved atoms into PLN / NAL for formal deduction
+;    (Paste the bio-extract output as the first premises)
+(metta (|~ ((Implication
+              (transcribes_to (gene $G) (transcript $T))
+              (Inheritance $G protein-coding))
+             (stv 1.0 0.9))
+            ((transcribes_to (gene ENSG00000125863) (transcript ENST00000353224))
+             (stv 1.0 0.9))))
+
+; 5. Send the reasoned conclusion
+(send "Gene ENSG00000125863 is protein-coding with confidence 0.9 (PLN inference over GENCODE graph)")
 ```
 
----
-
-## Recommended usage pattern
-
-1. Run `(bio-index "output")` once after startup.
-2. Use `(bio-query "...")` repeatedly while exploring/querying.
-3. Run `(bio-reindex "output")` when files change.
+**Key principle:** `bio-extract` and `bio-path` produce raw MeTTa atoms
+that can be copy-pasted directly as premises into `(|- ...)` or `(|~ ...)`
+inference blocks. This closes the loop between the biological knowledge graph
+and the formal symbolic reasoning engine.
 
 ---
 
-## Limits
+## CLI Tools
 
-- This is a structural index/query layer, not a full SPARQL/Cypher engine.
-- Comment stripping is line-based (`;` comments).
-- Query outputs are truncated to keep feedback manageable for the loop context.
+### `scripts/bio_query.py`
+
+```bash
+# Index and summarise
+python scripts/bio_query.py --root /data/output --index
+
+# Human-readable query
+python scripts/bio_query.py --root /data/output stats
+python scripts/bio_query.py --root /data/output node gene ENSG00000125863
+
+# Raw MeTTa extraction
+python scripts/bio_query.py --root /data/output --extract node gene ENSG00000125863
+
+# Path finding
+python scripts/bio_query.py --root /data/output --path ENSG00000125863 CHEBI:15422
+
+# Interactive REPL
+python scripts/bio_query.py --root /data/output --repl
+# Inside REPL: :extract node gene ENSG...  |  :path src dst  |  :reindex  |  :exit
+```
+
+Set a default root via environment or `.env`:
+
+```bash
+echo 'OMEGACLAW_BIO_OUTPUT_ROOT=/data/output' >> /path/to/OmegaClaw-Core/.env
+python scripts/bio_query.py stats   # --root inferred automatically
+```
+
+### `scripts/bio_smoke.py`
+
+```bash
+python scripts/bio_smoke.py --root /data/output
+```
+
+Runs index → stats → folders → predicates → sample node queries →
+bio-extract sample → bio-path sample. Good for validating a new dataset.
+
+---
+
+## Index Caching and Signature
+
+The index is cached in memory keyed by `(file_count, max_mtime, total_bytes)`.
+It is automatically invalidated if any file changes size or modification time.
+`bio-reindex` bypasses the check and forces a rebuild.
+
+---
+
+## Limitations
+
+- Structural index only — no full-text search, no SPARQL, no Cypher.
+- Comment stripping is line-based (`;` to end of line).
+- `bio-extract` output is truncated to 500 atoms to keep feedback manageable.
+- `bio-path` BFS is bounded by `max_hops` (default 5) and uses the in-memory
+  adjacency graph, so it requires `bio-index` to have been called first.

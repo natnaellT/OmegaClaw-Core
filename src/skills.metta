@@ -16,20 +16,27 @@
     "- Get technical analysis for a stock ticker using the Technical Analysis Agent: technical-analysis ticker"
     ;CODE EXECUTION:
     "- Execute MeTTa expression: metta sexpression"
-   "- Query BioCypher MeTTa exports: bio-query \"command\""
-   "- Query a specific output root: bio-query-in \"output_root\" \"command\""
-   "- Hot on-demand queries (no full index): bio-query-hot \"command\""
-    "Example to invoke Non-Axiomatic Logic via MeTTa: "
-    "metta (|- ((--> (× sam garfield) friend) (stv 1.0 0.9))"
-    "          ((--> garfield animal) (stv 1.0 0.9)))"
-    "metta (|- ((==> (--> (× $1 elephant) eat) (--> $1 ([] dangerous))) (stv 1.0 0.9))"
-    "          ((--> (× tiger elephant) eat) (stv 1.0 0.9)))"
+    ;BIO ATOMSPACE (BioCypher MeTTa exports):
+    "- Index BioCypher output folder (build or reuse cache): bio-index \"output_root\""
+    "- Force rebuild index from files: bio-reindex \"output_root\""
+    "- Query the indexed atomspace (human-readable): bio-query \"output_root\" \"command\""
+    "  Commands: stats | folders | predicates | folder <group> | predicate <name> | node <type> <id> | entity <id> | help"
+    "- Extract raw MeTTa atoms for symbolic injection: bio-extract \"output_root\" \"command\""
+    "  Same commands as bio-query. Output is raw s-expressions suitable for: metta (|- <atoms> <rule>)"
+    "- Find shortest path between two entities (returns MeTTa edge atoms): bio-path \"output_root\" \"src_id\" \"dst_id\""
+    "  Example: bio-path \"/data/output\" \"ENSG00000125863\" \"CHEBI:15422\""
+    "  Returns raw MeTTa atoms along the path, ready for symbolic reasoning."
+    "Example neuro-symbolic reasoning chain:"
+    "  1. bio-extract \"/data/output\" \"node gene ENSG00000125863\""
+    "  2. Take the returned MeTTa atoms, inject into metta skill with an inference rule:"
+    "     metta (|- (transcribes_to (gene ENSG00000125863) (transcript ENST0000353224))"
+    "               (Inheritance ENSG00000125863 protein-coding-gene))"
     "Also: note the $1 for independent variables, and for negated knowledge use (stv 0.0 0.9)"
-    "Additionally |- also works for revision, to merge evidence even when the term of both premises is the same."
-    "You can also use PLN:"
-    "metta (|~ ((Implication (Inheritance $1 (IntSet Feathered))"
-    "           (Inheritance $1 Bird)) (stv 1.0 0.9))"
-    "          ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"))
+    "Example NAL: metta (|- ((-->  (× sam garfield) friend) (stv 1.0 0.9))"
+    "                       ((-->  garfield animal) (stv 1.0 0.9)))"
+    "Example PLN: metta (|~ ((Implication (Inheritance $1 (IntSet Feathered))"
+    "                        (Inheritance $1 Bird)) (stv 1.0 0.9))"
+    "                       ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"))
 
 
 (= (read-file $file)
@@ -57,21 +64,21 @@
 (= (technical-analysis $ticker)
    (py-call (agentverse.technical_analysis $ticker)))
 
-
+; Bio atomspace skills — all take an explicit output_root as first argument
 (= (bio-index $root)
    (py-call (bio_graph.bio_index $root)))
 
 (= (bio-reindex $root)
    (py-call (bio_graph.bio_reindex $root)))
 
-(= (bio-query $q)
-   (py-call (bio_graph.bio_query $q)))
+(= (bio-query $root $q)
+   (py-call (bio_graph.bio_query $root $q)))
 
-(= (bio-query-in $root $q)
-   (py-call (bio_graph.bio_query_in $root $q)))
+(= (bio-extract $root $q)
+   (py-call (bio_graph.bio_extract $root $q)))
 
-(= (bio-query-hot $q)
-   (py-call (bio_graph.bio_query_hot $q)))
+(= (bio-path $root $src $dst)
+   (py-call (bio_graph.bio_path $root $src $dst)))
 
 !(import_prolog_functions_from_file (library OmegaClaw-Core ./src/skills.pl) (shell first_char gc read_file_tail))
 
