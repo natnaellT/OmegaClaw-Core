@@ -233,6 +233,8 @@ def balance_parentheses(s):
             
         line = _strip_outer_parens(line)
         parts = line.split(maxsplit=1)
+        if not parts:
+            continue
         cmd = parts[0]
         rest = parts[1].strip() if len(parts) > 1 else ""
         
@@ -292,3 +294,32 @@ def normalize_string(x):
         return str(x).encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
     except Exception:
         return str(x)
+
+
+def test_balance_parenthesis():
+    assert balance_parentheses('(write-file test.txt hello world)') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('(append-file test.txt hello world)') == '((append-file "test.txt" "hello world"))'
+    assert balance_parentheses('(write-file "test.txt" hello world)') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('(write-file "test.txt" "hello world")') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('(write-file test.txt "hello world")') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('(send test.xt hello world)') == '((send "test.xt hello world"))'
+    assert balance_parentheses('write-file test.txt hello world') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('append-file test.txt hello world') == '((append-file "test.txt" "hello world"))'
+    assert balance_parentheses('write-file "test.txt" hello world') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('write-file "test.txt" "hello world"') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('write-file test.txt "hello world"') == '((write-file "test.txt" "hello world"))'
+    assert balance_parentheses('send test.xt hello world') == '((send "test.xt hello world"))'
+    assert balance_parentheses('send Here are the planets:\n1. Mercury\n2. Venus') == '((send "Here are the planets:\\n1. Mercury\\n2. Venus"))'
+    assert balance_parentheses('send Here are the options:\n- MacBook Air\n- ThinkPad X1\npin done') == '((send "Here are the options:\\n- MacBook Air\\n- ThinkPad X1") (pin "done"))'
+    assert balance_parentheses('send "Plain text version:"\n**Mars** - red planet\nNote: Pluto is a dwarf planet') == '((send "Plain text version:\\n**Mars** - red planet\\nNote: Pluto is a dwarf planet"))'
+    assert balance_parentheses('(send Here are the planets:\n1. Mercury\n2. Venus)') == '((send "Here are the planets:\\n1. Mercury\\n2. Venus"))'
+    assert balance_parentheses('send "hello" world') == '((send "\\"hello\\" world"))'
+    # bare "()" lines yield no tokens after _strip_outer_parens and must be skipped, not crash
+    assert balance_parentheses('()') == '()'
+    assert balance_parentheses('') == '()'
+    assert balance_parentheses('   ') == '()'
+    assert balance_parentheses('()\nsend hello') == '((send "hello"))'
+
+
+if __name__ == "__main__":
+    test_balance_parenthesis()
