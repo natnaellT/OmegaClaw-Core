@@ -42,6 +42,8 @@
     "  2. Take the returned MeTTa atoms, inject into metta skill with an inference rule:"
     "     metta (|- (transcribes_to (gene ENSG00000125863) (transcript ENST0000353224))"
     "               (Inheritance ENSG00000125863 protein-coding-gene))"
+    "- Merge evidence for an edge using Truth_Revision: bio-pln-evidence-merge \"src_id\" \"edge_type\" \"dst_id\" \"output_root\""
+    "- Calculate confidence for a multi-hop path using Truth_Deduction: bio-pln-chain-confidence \"path_string\" \"output_root\""
 
 
 (= (read-file $file)
@@ -84,6 +86,12 @@
 
 (= (bio-path $root $src $dst)
    (py-call (bio_graph.bio_path $root $src $dst)))
+
+(= (bio-pln-evidence-merge $src $edge $dst $root)
+   (py-call (bio_reasoner.pln_evidence_merge $src $edge $dst $root)))
+
+(= (bio-pln-chain-confidence $path $root)
+   (py-call (bio_reasoner.pln_chain_confidence $path $root)))
 
 !(import_prolog_functions_from_file (library OmegaClaw-Core ./src/skills.pl) (shell first_char gc read_file_tail))
 

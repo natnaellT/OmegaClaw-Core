@@ -34,7 +34,8 @@ Public functions exposed to MeTTa:
 - `bio_index(output_root="output")`
 - `bio_reindex(output_root="output")`
 - `bio_query(query, output_root="output")`
-- `bio_query_in(output_root, query)`
+- `bio_extract(output_root, query)`
+- `bio_path(output_root, src_id, dst_id)`
 
 ### 2) New MeTTa skills
 
@@ -43,7 +44,8 @@ Public functions exposed to MeTTa:
   - `(bio-index)` / `(bio-index "...")`
   - `(bio-reindex)` / `(bio-reindex "...")`
   - `(bio-query "...")`
-  - `(bio-query-in "..." "...")`
+  - `(bio-extract "..." "...")`
+  - `(bio-path "..." "..." "...")`
 
 ### 3) Runtime import wiring
 
@@ -96,8 +98,8 @@ Important: do not run `(bio-index ...)` directly in Bash. These are MeTTa expres
 
 ```metta
 (bio-index "/home/natnael/dev/biocypher-kg-/output_human")
-(bio-query-in "/home/natnael/dev/biocypher-kg-/output_human" "stats")
-(bio-query-in "/home/natnael/dev/biocypher-kg-/output_human" "node transcript ENST00000353224")
+(bio-query "/home/natnael/dev/biocypher-kg-/output_human" "stats")
+(bio-extract "/home/natnael/dev/biocypher-kg-/output_human" "node transcript ENST00000353224")
 ```
 
 Expected high-level outcome:
@@ -155,7 +157,7 @@ Inside `--repl`, examples:
 ```text
 predicate gene
 node gene ENSG00000125863
-neighbors gene ENSG00000125863
+:extract node gene ENSG00000125863
 ```
 
 If `metta` is installed, create a small file and run it:
@@ -164,8 +166,8 @@ If `metta` is installed, create a small file and run it:
 cat > bio_smoke.metta <<'METTA'
 !(import! &self (library lib_omegaclaw))
 !(bio-index "/home/natnael/dev/biocypher-kg-/output_human")
-!(bio-query-in "/home/natnael/dev/biocypher-kg-/output_human" "stats")
-!(bio-query-in "/home/natnael/dev/biocypher-kg-/output_human" "node transcript ENST00000353224")
+!(bio-query "/home/natnael/dev/biocypher-kg-/output_human" "stats")
+!(bio-extract "/home/natnael/dev/biocypher-kg-/output_human" "node transcript ENST00000353224")
 METTA
 
 metta bio_smoke.metta

@@ -16,14 +16,9 @@ Otherwise do not send.
 
 Neuro-symbolic bio reasoning (Bio-Claw):
 When asked biological questions, use this chain:
-1. Index the atomspace once: bio-index "/path/to/output"
-2. Retrieve relevant atoms: bio-extract "/path/to/output" "node gene ENSG..."
-   (bio-extract returns raw MeTTa s-expressions — not human text)
-3. For path queries: bio-path "/path/to/output" "ENSG..." "CHEBI:..."
-   (returns the chain of MeTTa atoms connecting two entities)
-4. Inject retrieved atoms into symbolic reasoning:
-   metta (|- <paste-bio-extract-output-here> <your-inference-rule>)
-   This lets PLN/NAL reason formally over real biological graph facts.
-5. Send a reasoned answer backed by the symbolic proof.
-
-Rule: bio-extract and bio-path outputs are raw MeTTa — feed them to metta, not to the user directly.
+1. Extract relevant entities: bio-query "/path/to/output" "node gene ENSG..."
+2. Find the chain of evidence: bio-path "/path/to/output" "ENSG..." "CHEBI:..."
+3. DO NOT write raw MeTTa syntax for biological reasoning! To avoid syntax errors, use the safe Python logic wrappers:
+   - To calculate path confidence: bio-pln-chain-confidence "ENSG...,...,CHEBI:..." "/path/to/output"
+   - To merge parallel evidence: bio-pln-evidence-merge "ENSG..." "edge_type" "CHEBI:..." "/path/to/output"
+4. Send a reasoned answer backed by the returned confidence values.

@@ -18,3 +18,4 @@ Autotests/logs/
 # IDE
 .idea/
 .venv/
+.vscode/

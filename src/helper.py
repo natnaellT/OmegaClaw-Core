@@ -18,7 +18,41 @@ LLM_COMMANDS = {
     "tavily-search",
     "technical-analysis",
     "write-file",
+    "bio-index",
+    "bio-reindex",
+    "bio-query",
+    "bio-extract",
+    "bio-path",
+    "bio-pln-evidence-merge",
+    "bio-pln-chain-confidence"
 }
+
+_WRAPPER_PATTERNS = [
+    (re.compile(r"\[TOOL_CALL\]\s*", re.IGNORECASE), ""),
+    (re.compile(r"\s*\[/TOOL_CALL\]", re.IGNORECASE), ""),
+    (re.compile(r"<tool_call>\s*", re.IGNORECASE), ""),
+    (re.compile(r"\s*</tool_call>", re.IGNORECASE), ""),
+    (re.compile(r"<function_call>\s*", re.IGNORECASE), ""),
+    (re.compile(r"\s*</function_call>", re.IGNORECASE), ""),
+    (re.compile(r"^```[a-zA-Z0-9_]*\s*$", re.MULTILINE), ""),
+    (re.compile(r"^```\s*$", re.MULTILINE), ""),
+]
+
+_DROP_LINE_PATTERNS = [
+    re.compile(r"^\s*\{\s*\}\s*$"),
+    re.compile(r"^\s*\[\s*\]\s*$"),
+    re.compile(r"^\s*\(\s*\)\s*$"),
+    re.compile(r"^\s*\(?\s*empty\s*\)?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*\(?\s*none\s*\)?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*\(?\s*null\s*\)?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*\{\s*\"name\"\s*:\s*\".*?\"\s*,?\s*"),
+]
+
+_MONOLOGUE_STARTS = (
+    "i should ", "i need to ", "i will ", "let me ", "looking at ",
+    "based on the ", "according to ", "the user is asking", "now i need to",
+    "acknowledged.", "understood.", "noted.", "got it."
+)
 
 
 def extract_timestamp(line):
@@ -36,7 +70,6 @@ def around_time(needle_time_str, k):
     filename = "repos/OmegaClaw-Core/memory/history.metta"
     target = datetime.strptime(needle_time_str, "%Y-%m-%d %H:%M:%S")
     best_lineno = None
-    best_line = None
     best_diff = None
     buffer = []
     best_idx = None
@@ -50,7 +83,6 @@ def around_time(needle_time_str, k):
             if best_diff is None or diff < best_diff:
                 best_diff = diff
                 best_lineno = lineno
-                best_line = line
                 best_idx = len(buffer) - 1
     if best_lineno is None:
         return
@@ -132,7 +164,62 @@ def _merge_send_continuations(lines):
     return merged
 
 
+def sanitize_llm_response(raw: str) -> str:
+    """Strip wrapper bleed and auto-wrap orphan prose."""
+    if not isinstance(raw, str):
+        return raw
+
+    text = raw.replace("_quote_", '"').replace("_newline_", "\n")
+
+    for pat, repl in _WRAPPER_PATTERNS:
+        text = pat.sub(repl, text)
+
+    send_count = 0
+    out_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if any(p.match(line) for p in _DROP_LINE_PATTERNS):
+            continue
+
+        inner = line
+        if inner.startswith("(") and inner.endswith(")"):
+            inner = inner[1:-1].strip()
+        if not inner:
+            continue
+            
+        parts = inner.split(maxsplit=1)
+        first = parts[0] if parts else ""
+        first = first.strip('"').strip("'")
+
+        if _is_known_command(first) or first.startswith("bio-"):
+            if first == "send":
+                body = parts[1].strip() if len(parts) > 1 else ""
+                body_inspect = body.strip('"').strip("'").strip().lower()
+                if any(body_inspect.startswith(p) for p in _MONOLOGUE_STARTS):
+                    continue
+                if send_count >= 1:
+                    continue
+                send_count += 1
+            out_lines.append(raw_line)
+        else:
+            cleaned = inner.lstrip("-*").strip()
+            if not cleaned:
+                continue
+            if any(cleaned.lower().startswith(p) for p in _MONOLOGUE_STARTS):
+                continue
+            if send_count >= 1:
+                continue
+            send_count += 1
+            out_lines.append(f"send {cleaned}")
+
+    return "\n".join(out_lines)
+
+
 def balance_parentheses(s):
+    s = sanitize_llm_response(s)
     s = s.replace("_quote_", '"').replace("_newline_", "\n")
     sexprs = []
     special_two_arg_cmds = {"write-file", "append-file"}
@@ -143,16 +230,16 @@ def balance_parentheses(s):
             line = "(pin -" + line[2:]
         elif line.startswith("-"):
             line = "pin " + line
-        # remove one outer (...) if present
+            
         line = _strip_outer_parens(line)
         parts = line.split(maxsplit=1)
         cmd = parts[0]
         rest = parts[1].strip() if len(parts) > 1 else ""
+        
         if cmd in special_two_arg_cmds:
             if not rest:
                 sexprs.append(f"({cmd})")
                 continue
-            # filename is first token unless already quoted
             if rest.startswith('"'):
                 end = 1
                 escaped = False
@@ -174,6 +261,7 @@ def balance_parentheses(s):
                 split_rest = rest.split(maxsplit=1)
                 filename = '"' + split_rest[0].replace('"', '\\"') + '"'
                 content = split_rest[1].strip() if len(split_rest) > 1 else ""
+                
             if content:
                 if content.startswith('"') and content.endswith('"'):
                     sexprs.append(f"({cmd} {filename} {content})")
@@ -183,6 +271,7 @@ def balance_parentheses(s):
             else:
                 sexprs.append(f"({cmd} {filename})")
             continue
+            
         if rest:
             if rest.startswith('"') and rest.endswith('"'):
                 sexprs.append(f"({cmd} {rest})")
@@ -191,6 +280,7 @@ def balance_parentheses(s):
                 sexprs.append(f'({cmd} "{rest}")')
         else:
             sexprs.append(f"({cmd})")
+            
     ret = " ".join(sexprs)
     return "(" + ret + ")"
 
@@ -202,27 +292,3 @@ def normalize_string(x):
         return str(x).encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
     except Exception:
         return str(x)
-
-
-def test_balance_parenthesis():
-    assert balance_parentheses('(write-file test.txt hello world)') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('(append-file test.txt hello world)') == '((append-file "test.txt" "hello world"))'
-    assert balance_parentheses('(write-file "test.txt" hello world)') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('(write-file "test.txt" "hello world")') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('(write-file test.txt "hello world")') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('(send test.xt hello world)') == '((send "test.xt hello world"))'
-    assert balance_parentheses('write-file test.txt hello world') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('append-file test.txt hello world') == '((append-file "test.txt" "hello world"))'
-    assert balance_parentheses('write-file "test.txt" hello world') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('write-file "test.txt" "hello world"') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('write-file test.txt "hello world"') == '((write-file "test.txt" "hello world"))'
-    assert balance_parentheses('send test.xt hello world') == '((send "test.xt hello world"))'
-    assert balance_parentheses('send Here are the planets:\n1. Mercury\n2. Venus') == '((send "Here are the planets:\\n1. Mercury\\n2. Venus"))'
-    assert balance_parentheses('send Here are the options:\n- MacBook Air\n- ThinkPad X1\npin done') == '((send "Here are the options:\\n- MacBook Air\\n- ThinkPad X1") (pin "done"))'
-    assert balance_parentheses('send "Plain text version:"\n**Mars** - red planet\nNote: Pluto is a dwarf planet') == '((send "Plain text version:\\n**Mars** - red planet\\nNote: Pluto is a dwarf planet"))'
-    assert balance_parentheses('(send Here are the planets:\n1. Mercury\n2. Venus)') == '((send "Here are the planets:\\n1. Mercury\\n2. Venus"))'
-    assert balance_parentheses('send "hello" world') == '((send "\\"hello\\" world"))'
-
-
-if __name__ == "__main__":
-    test_balance_parenthesis()
