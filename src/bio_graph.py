@@ -1,107 +1,118 @@
+"""Bio-Claw: on-demand biological graph engine for OmegaClaw.
+
+Two-tier architecture:
+  Tier 1 — HotIndex: lightweight pointer map (entity/head/folder → file paths).
+            Built once per root; invalidated automatically by filesystem signature.
+  Tier 2 — ParseCache: bounded LRU of per-file parsed atoms.
+            Files are parsed and cached only when a query needs them.
+
+Public API: bio_index · bio_reindex · bio_query · bio_extract · bio_path
+"""
 from __future__ import annotations
 
 import os
 import shlex
-import subprocess
-import shutil
-import time
-from collections import Counter, defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Set, Sequence, Tuple, Union
 
 Term = Union[str, List["Term"]]
 
 
+# ---------------------------------------------------------------------------
+# Domain types
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Atom:
-    """One parsed top-level MeTTa s-expression, fully indexed."""
-    atom_id: int
-    relation_group: str   # first-level directory name under root
-    file_kind: str        # file basename without extension (e.g. "nodes")
-    file_path: str
+    head: str
+    entities: List[Tuple[str, str]]
+    raw: str
+    relation_group: str
+    file_kind: str
     line: int
-    raw: str              # original source text of the atom
-    head: str             # leading symbol, e.g. "transcribes_to"
-    entities: List[Tuple[str, str]]  # [(type, id), ...] extracted from atom
 
 
 @dataclass
-class BioIndex:
+class HotIndex:
     root: str
-    signature: Tuple[int, int, int]   # (file_count, max_mtime, total_bytes)
-    files_scanned: int = 0
-    parse_errors: int = 0
-    atoms: List[Atom] = field(default_factory=list)
-    by_folder: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
-    by_head: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
-    # (normalised_type, normalised_id) → atom_ids
-    by_entity: Dict[Tuple[str, str], List[int]] = field(default_factory=lambda: defaultdict(list))
-    # normalised_id → atom_ids  (type-agnostic lookup)
-    by_entity_id: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
+    signature: Tuple[int, int, int]
+    file_count: int
+    atom_count: int
+    entity_to_files: Dict[str, Set[str]]
+    head_to_files: Dict[str, Set[str]]
+    folder_to_files: Dict[str, List[str]]
+    folder_counts: Dict[str, int]
+    head_counts: Dict[str, int]
 
 
-# Full index cache: abs_root → BioIndex
-_INDEX_CACHE: Dict[str, BioIndex] = {}
+# ---------------------------------------------------------------------------
+# Tier 1: pointer map cache  |  Tier 2: per-file LRU parse cache
+# ---------------------------------------------------------------------------
 
-# Per-file parse cache for hot/partial queries: abs_path → {"sig": ..., "atoms": ..., "ts": ...}
-_FILE_CACHE: Dict[str, dict] = {}
-_FILE_CACHE_MAX = 256   # LRU cap
+_INDEX: Dict[str, HotIndex] = {}
 
-def _norm_type(t: str) -> str:
-    return t.strip().lower()
+_FILE_CACHE: OrderedDict[str, List[Atom]] = OrderedDict()
+_FILE_CACHE_MAX = 256
 
 
-def _norm_id(i: str) -> str:
-    return i.strip().lower()
+def _cache_get(path: str) -> Optional[List[Atom]]:
+    if path not in _FILE_CACHE:
+        return None
+    _FILE_CACHE.move_to_end(path)
+    return _FILE_CACHE[path]
+
+
+def _cache_set(path: str, atoms: List[Atom]) -> None:
+    if path in _FILE_CACHE:
+        _FILE_CACHE.move_to_end(path)
+    else:
+        if len(_FILE_CACHE) >= _FILE_CACHE_MAX:
+            _FILE_CACHE.popitem(last=False)
+        _FILE_CACHE[path] = atoms
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def _norm(s: str) -> str:
+    return s.strip().lower()
 
 
 def _strip_comments(text: str) -> str:
-    """Strip MeTTa line comments (`;` to end of line)."""
-    lines = []
-    for line in text.splitlines():
-        if ";" in line:
-            line = line.split(";", 1)[0]
-        lines.append(line)
-    return "\n".join(lines)
+    return "\n".join(line.split(";", 1)[0] for line in text.splitlines())
 
 
-def _iter_top_level_atoms(text: str) -> Iterator[Tuple[str, int]]:
-    """Yield (raw_atom_text, start_line) for each top-level parenthesised expression."""
-    depth = 0
-    start = -1
-    start_line = 1
-    line = 1
+def _iter_atoms(text: str) -> Iterator[Tuple[str, int]]:
+    depth, start, start_line, line = 0, -1, 1, 1
     for idx, ch in enumerate(text):
         if ch == "\n":
             line += 1
         if ch == "(":
             if depth == 0:
-                start = idx
-                start_line = line
+                start, start_line = idx, line
             depth += 1
-        elif ch == ")":
-            if depth == 0:
-                continue
+        elif ch == ")" and depth > 0:
             depth -= 1
             if depth == 0 and start >= 0:
-                atom = text[start: idx + 1].strip()
+                atom = text[start:idx + 1].strip()
                 if atom:
                     yield atom, start_line
                 start = -1
 
 
-def _tokenize(atom: str) -> List[str]:
+def _tokenize(text: str) -> List[str]:
     tokens: List[str] = []
     cur: List[str] = []
-    in_str = False
-    escaped = False
+    in_str = escaped = False
 
-    def flush():
+    def flush() -> None:
         if cur:
             tokens.append("".join(cur))
             cur.clear()
 
-    for ch in atom:
+    for ch in text:
         if in_str:
             cur.append(ch)
             if escaped:
@@ -111,33 +122,27 @@ def _tokenize(atom: str) -> List[str]:
             elif ch == '"':
                 in_str = False
                 flush()
-            continue
-        if ch.isspace():
+        elif ch.isspace():
             flush()
-            continue
-        if ch == '"':
+        elif ch == '"':
             flush()
             in_str = True
             cur.append(ch)
-            continue
-        if ch in "()":
+        elif ch in "()":
             flush()
             tokens.append(ch)
-            continue
-        cur.append(ch)
+        else:
+            cur.append(ch)
     flush()
     return tokens
 
 
-def _parse_term(tokens: List[str], i: int = 0) -> Tuple[Term, int]:
+def _parse_term(tokens: Sequence[str], i: int = 0) -> Tuple[Term, int]:
     if i >= len(tokens):
-        raise ValueError("Unexpected end of token stream")
+        raise ValueError("Unexpected end of tokens")
     tok = tokens[i]
     if tok != "(":
-        # strip surrounding quotes from string literals
-        if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
-            return tok[1:-1], i + 1
-        return tok, i + 1
+        return (tok[1:-1] if len(tok) >= 2 and tok[0] == tok[-1] == '"' else tok), i + 1
     i += 1
     out: List[Term] = []
     while i < len(tokens) and tokens[i] != ")":
@@ -148,386 +153,384 @@ def _parse_term(tokens: List[str], i: int = 0) -> Tuple[Term, int]:
     return out, i + 1
 
 
-def _parse_atom(raw: str) -> Term:
+def _parse_atom_raw(raw: str) -> Term:
     tokens = _tokenize(raw)
-    parsed, consumed = _parse_term(tokens, 0)
+    parsed, consumed = _parse_term(tokens)
     if consumed != len(tokens):
-        raise ValueError("Trailing tokens after parse")
+        raise ValueError("Trailing tokens")
     return parsed
 
 
 def _collect_entities(term: Term, out: Set[Tuple[str, str]]) -> None:
-    """Recursively find (type, id) pairs: any 2-element list of two strings."""
     if isinstance(term, str):
         return
-    if len(term) == 2 and isinstance(term[0], str) and isinstance(term[1], str):
+    if len(term) == 2 and all(isinstance(c, str) for c in term):
         out.add((term[0], term[1]))
     for child in term[1:]:
         _collect_entities(child, out)
 
 
-def _walk_metta_files(root: str) -> Iterator[Tuple[str, str, str]]:
-    """Yield (abs_file_path, relation_group, file_kind) for every .metta file."""
-    for dirpath, _, filenames in os.walk(root):
-        rel = os.path.relpath(dirpath, root)
-        relation_group = rel.split(os.sep, 1)[0] if rel != "." else "_root"
-        for name in sorted(filenames):
-            if name.endswith(".metta"):
-                yield os.path.join(dirpath, name), relation_group, os.path.splitext(name)[0].lower()
+def _parse_file(file_path: str, relation_group: str, file_kind: str) -> List[Atom]:
+    cached = _cache_get(file_path)
+    if cached is not None:
+        return cached
 
-
-def _compute_signature(root: str) -> Tuple[int, int, int]:
-    file_paths = [fp for fp, _, _ in _walk_metta_files(root)]
-    if not file_paths:
-        return 0, 0, 0
-    mtime = 0
-    size = 0
-    for fp in file_paths:
-        st = os.stat(fp)
-        mtime = max(mtime, int(st.st_mtime))
-        size += int(st.st_size)
-    return len(file_paths), mtime, size
-
-
-def _parse_file_into_atoms(file_path: str, relation_group: str, file_kind: str,
-                            id_offset: int = 0) -> Tuple[List[Atom], int]:
-    atoms: List[Atom] = []
-    errors = 0
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             content = _strip_comments(fh.read())
     except OSError:
-        return atoms, errors
+        return []
 
-    next_id = id_offset
-    for raw, line in _iter_top_level_atoms(content):
+    atoms: List[Atom] = []
+    for raw, line in _iter_atoms(content):
         try:
-            parsed = _parse_atom(raw)
+            parsed = _parse_atom_raw(raw)
         except ValueError:
-            errors += 1
             continue
         if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], str):
-            errors += 1
             continue
-        head = parsed[0]
         ents: Set[Tuple[str, str]] = set()
         _collect_entities(parsed, ents)
         atoms.append(Atom(
-            atom_id=next_id,
+            head=parsed[0],
+            entities=sorted(ents),
+            raw=raw,
             relation_group=relation_group,
             file_kind=file_kind,
-            file_path=file_path,
             line=line,
-            raw=raw,
-            head=head,
-            entities=sorted(ents),
         ))
-        next_id += 1
-    return atoms, errors
+
+    _cache_set(file_path, atoms)
+    return atoms
 
 
-def _build_index(root: str) -> BioIndex:
-    file_specs = list(_walk_metta_files(root))
-    if not file_specs:
-        raise ValueError(
-            f"No .metta files found under '{root}'. "
-            "Expected BioCypher output structure with subdirectories containing .metta files."
-        )
-    sig = _compute_signature(root)
-    idx = BioIndex(root=root, signature=sig, files_scanned=len(file_specs))
-    offset = 0
-    for fp, rg, fk in file_specs:
-        new_atoms, errs = _parse_file_into_atoms(fp, rg, fk, id_offset=offset)
-        idx.parse_errors += errs
-        for atom in new_atoms:
-            idx.atoms.append(atom)
-            idx.by_folder[rg].append(atom.atom_id)
-            idx.by_head[atom.head].append(atom.atom_id)
-            for et, ei in atom.entities:
-                nt, ni = _norm_type(et), _norm_id(ei)
-                idx.by_entity[(nt, ni)].append(atom.atom_id)
-                idx.by_entity_id[ni].append(atom.atom_id)
-        offset += len(new_atoms)
-    return idx
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+def _walk_files(root: str) -> Iterator[Tuple[str, str, str]]:
+    for dirpath, _, names in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        group = rel.split(os.sep, 1)[0] if rel != "." else "_root"
+        for name in sorted(names):
+            if name.endswith(".metta"):
+                yield os.path.join(dirpath, name), group, os.path.splitext(name)[0].lower()
 
 
-def _ensure_index(root: str, force: bool = False) -> BioIndex:
+def _signature(root: str) -> Tuple[int, int, int]:
+    files = [fp for fp, _, _ in _walk_files(root)]
+    if not files:
+        return 0, 0, 0
+    mtime = max(int(os.stat(fp).st_mtime) for fp in files)
+    size = sum(os.stat(fp).st_size for fp in files)
+    return len(files), mtime, size
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 build: streaming scan — pointer maps only, no atom storage
+# ---------------------------------------------------------------------------
+
+def _build(root: str) -> HotIndex:
+    specs = list(_walk_files(root))
+    if not specs:
+        raise ValueError(f"No .metta files found under '{root}'")
+
+    sig = _signature(root)
+    entity_to_files: Dict[str, Set[str]] = defaultdict(set)
+    head_to_files: Dict[str, Set[str]] = defaultdict(set)
+    folder_to_files: Dict[str, List[str]] = defaultdict(list)
+    folder_counts: Dict[str, int] = defaultdict(int)
+    head_counts: Dict[str, int] = defaultdict(int)
+    atom_count = 0
+
+    for fp, group, kind in specs:
+        folder_to_files[group].append(fp)
+        for atom in _parse_file(fp, group, kind):
+            atom_count += 1
+            folder_counts[group] += 1
+            head_counts[atom.head] += 1
+            head_to_files[atom.head].add(fp)
+            for _, eid in atom.entities:
+                entity_to_files[_norm(eid)].add(fp)
+
+    return HotIndex(
+        root=root,
+        signature=sig,
+        file_count=len(specs),
+        atom_count=atom_count,
+        entity_to_files=dict(entity_to_files),
+        head_to_files=dict(head_to_files),
+        folder_to_files=dict(folder_to_files),
+        folder_counts=dict(folder_counts),
+        head_counts=dict(head_counts),
+    )
+
+
+def _ensure(root: str, force: bool = False) -> HotIndex:
     abs_root = os.path.abspath(root)
     if not os.path.isdir(abs_root):
         raise ValueError(f"Output folder not found: '{root}'")
-    sig = _compute_signature(abs_root)
-    cached = _INDEX_CACHE.get(abs_root)
-    if not force and cached is not None and cached.signature == sig:
+    sig = _signature(abs_root)
+    cached = _INDEX.get(abs_root)
+    if not force and cached and cached.signature == sig:
         return cached
-    idx = _build_index(abs_root)
-    _INDEX_CACHE[abs_root] = idx
+    idx = _build(abs_root)
+    _INDEX[abs_root] = idx
     return idx
 
 
-def _fmt_summary(idx: BioIndex) -> str:
-    return (
-        f"indexed root={idx.root} files={idx.files_scanned} "
-        f"atoms={len(idx.atoms)} relations={len(idx.by_folder)} "
-        f"predicates={len(idx.by_head)} parse_errors={idx.parse_errors}"
-    )
+# ---------------------------------------------------------------------------
+# On-demand atom retrieval (Tier 2 — reads only what the query needs)
+# ---------------------------------------------------------------------------
+
+def _resolve_file_meta(idx: HotIndex, fp: str) -> Tuple[str, str]:
+    for group, files in idx.folder_to_files.items():
+        if fp in files:
+            return group, os.path.splitext(os.path.basename(fp))[0].lower()
+    return "_root", os.path.splitext(os.path.basename(fp))[0].lower()
 
 
-def _dedup(ids: List[int]) -> List[int]:
-    seen: Set[int] = set()
-    out = []
-    for i in ids:
-        if i not in seen:
-            seen.add(i)
-            out.append(i)
-    return out
+def _atoms_for_entity(idx: HotIndex, entity_id: str,
+                       entity_type: Optional[str] = None) -> List[Atom]:
+    norm_id = _norm(entity_id)
+    norm_type = _norm(entity_type) if entity_type else None
+    result: List[Atom] = []
+    for fp in idx.entity_to_files.get(norm_id, set()):
+        group, kind = _resolve_file_meta(idx, fp)
+        for atom in _parse_file(fp, group, kind):
+            for et, ei in atom.entities:
+                if _norm(ei) == norm_id and (norm_type is None or _norm(et) == norm_type):
+                    result.append(atom)
+                    break
+    return result
 
 
-def _fmt_atom_records(idx: BioIndex, atom_ids: List[int], limit: int = 20) -> str:
-    if not atom_ids:
+def _atoms_for_head(idx: HotIndex, head: str) -> List[Atom]:
+    result: List[Atom] = []
+    for fp in idx.head_to_files.get(head, set()):
+        group, kind = _resolve_file_meta(idx, fp)
+        result.extend(a for a in _parse_file(fp, group, kind) if a.head == head)
+    return result
+
+
+def _atoms_for_folder(idx: HotIndex, group: str) -> List[Atom]:
+    result: List[Atom] = []
+    for fp in idx.folder_to_files.get(group, []):
+        _, kind = _resolve_file_meta(idx, fp)
+        result.extend(_parse_file(fp, group, kind))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Output formatters
+# ---------------------------------------------------------------------------
+
+def _fmt_records(atoms: List[Atom], limit: int = 20) -> str:
+    if not atoms:
         return "no matches"
-    lines = [f"matches={len(atom_ids)} showing={min(limit, len(atom_ids))}"]
-    for aid in atom_ids[:limit]:
-        a = idx.atoms[aid]
-        rel = os.path.relpath(a.file_path, idx.root)
-        lines.append(f"[{a.relation_group}/{a.file_kind}] {rel}:{a.line} {a.raw}")
-    if len(atom_ids) > limit:
-        lines.append(f"... {len(atom_ids) - limit} more")
+    lines = [f"matches={len(atoms)} showing={min(limit, len(atoms))}"]
+    for a in atoms[:limit]:
+        lines.append(f"[{a.relation_group}/{a.file_kind}]:{a.line} {a.raw}")
+    if len(atoms) > limit:
+        lines.append(f"... {len(atoms) - limit} more")
     return "\n".join(lines)
 
 
-def _fmt_raw_atoms(idx: BioIndex, atom_ids: List[int], limit: int = 500) -> str:
-    """Return bare MeTTa s-expressions, one per line — for neuro-symbolic injection."""
-    if not atom_ids:
-        return ""
-    parts = []
-    for aid in atom_ids[:limit]:
-        parts.append(idx.atoms[aid].raw)
-    if len(atom_ids) > limit:
-        parts.append(f"; ... {len(atom_ids) - limit} more atoms truncated")
+def _fmt_raw(atoms: List[Atom], limit: int = 500) -> str:
+    parts = [a.raw for a in atoms[:limit]]
+    if len(atoms) > limit:
+        parts.append(f"; ... {len(atoms) - limit} more atoms truncated")
     return "\n".join(parts)
 
 
-#query dispatcher
-def _help_text() -> str:
+def _help() -> str:
     return (
-        "bio-query commands:\n"
-        "  stats                        — index summary + top relations/predicates\n"
-        "  folders                      — list all relation groups with atom counts\n"
-        "  predicates                   — list all predicate heads with atom counts\n"
-        "  folder   <group>             — all atoms in a relation group\n"
-        "  predicate <name>             — all atoms with this predicate head\n"
-        "  node     <type> <id>         — atoms containing (type id)\n"
-        "  entity   <id>               — atoms containing id (any type)\n"
+        "commands: stats | folders | predicates | "
+        "folder <group> | predicate <name> | node <type> <id> | entity <id>"
     )
 
 
-def _q_stats(idx: BioIndex) -> str:
-    folders = sorted(idx.by_folder.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    preds = sorted(idx.by_head.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    top_f = " ".join(f"{k}:{len(v)}" for k, v in folders[:10])
-    top_p = " ".join(f"{k}:{len(v)}" for k, v in preds[:10])
-    return f"{_fmt_summary(idx)}\ntop_relations {top_f}\ntop_predicates {top_p}"
+# ---------------------------------------------------------------------------
+# Query dispatcher
+# ---------------------------------------------------------------------------
 
-
-def _q_folders(idx: BioIndex) -> str:
-    items = sorted(idx.by_folder.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    return "\n".join(f"{k} atoms={len(v)}" for k, v in items)
-
-
-def _q_predicates(idx: BioIndex) -> str:
-    items = sorted(idx.by_head.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    return "\n".join(f"{k} atoms={len(v)}" for k, v in items)
-
-
-def _q_node(idx: BioIndex, args: List[str]) -> str:
-    if len(args) < 2:
-        return "usage: node <entity_type> <entity_id>"
-    ids = _dedup(idx.by_entity.get((_norm_type(args[0]), _norm_id(args[1])), []))
-    return _fmt_atom_records(idx, ids)
-
-
-def _q_entity(idx: BioIndex, args: List[str]) -> str:
-    if not args:
-        return "usage: entity <entity_id>"
-    ids = _dedup(idx.by_entity_id.get(_norm_id(args[0]), []))
-    return _fmt_atom_records(idx, ids)
-
-
-def _q_predicate(idx: BioIndex, args: List[str]) -> str:
-    if not args:
-        return "usage: predicate <name>"
-    ids = _dedup(idx.by_head.get(args[0], []))
-    return _fmt_atom_records(idx, ids)
-
-
-def _q_folder(idx: BioIndex, args: List[str]) -> str:
-    if not args:
-        return "usage: folder <relation_group>"
-    ids = _dedup(idx.by_folder.get(args[0], []))
-    return _fmt_atom_records(idx, ids)
-
-
-def _dispatch(idx: BioIndex, query: str, raw_metta: bool = False) -> str:
+def _dispatch(idx: HotIndex, query: str, raw: bool = False) -> str:
     try:
         parts = shlex.split(query)
     except ValueError as exc:
         return f"query parse error: {exc}"
     if not parts:
-        return _help_text()
+        return _help()
+
     cmd, args = parts[0].lower(), parts[1:]
+
     if cmd == "help":
-        return _help_text()
+        return _help()
+
     if cmd == "stats":
-        return _q_stats(idx)
+        top_f = " ".join(f"{k}:{v}" for k, v in
+                         sorted(idx.folder_counts.items(), key=lambda x: -x[1])[:10])
+        top_p = " ".join(f"{k}:{v}" for k, v in
+                         sorted(idx.head_counts.items(), key=lambda x: -x[1])[:10])
+        return (
+            f"root={idx.root} files={idx.file_count} atoms={idx.atom_count} "
+            f"relations={len(idx.folder_counts)} predicates={len(idx.head_counts)}\n"
+            f"top_relations {top_f}\ntop_predicates {top_p}"
+        )
+
     if cmd == "folders":
-        return _q_folders(idx)
+        return "\n".join(
+            f"{k} atoms={v}"
+            for k, v in sorted(idx.folder_counts.items(), key=lambda x: -x[1])
+        )
+
     if cmd == "predicates":
-        return _q_predicates(idx)
+        return "\n".join(
+            f"{k} atoms={v}"
+            for k, v in sorted(idx.head_counts.items(), key=lambda x: -x[1])
+        )
+
     if cmd == "folder":
-        ids = _dedup(idx.by_folder.get(args[0] if args else "", []))
-        if raw_metta:
-            return _fmt_raw_atoms(idx, ids)
-        return _q_folder(idx, args)
+        if not args:
+            return "usage: folder <group>"
+        atoms = _atoms_for_folder(idx, args[0])
+        return _fmt_raw(atoms) if raw else _fmt_records(atoms)
+
     if cmd == "predicate":
-        ids = _dedup(idx.by_head.get(args[0] if args else "", []))
-        if raw_metta:
-            return _fmt_raw_atoms(idx, ids)
-        return _q_predicate(idx, args)
+        if not args:
+            return "usage: predicate <name>"
+        atoms = _atoms_for_head(idx, args[0])
+        return _fmt_raw(atoms) if raw else _fmt_records(atoms)
+
     if cmd == "node":
         if len(args) < 2:
-            return "usage: node <entity_type> <entity_id>"
-        ids = _dedup(idx.by_entity.get((_norm_type(args[0]), _norm_id(args[1])), []))
-        if raw_metta:
-            return _fmt_raw_atoms(idx, ids)
-        return _fmt_atom_records(idx, ids)
+            return "usage: node <type> <id>"
+        atoms = _atoms_for_entity(idx, args[1], args[0])
+        return _fmt_raw(atoms) if raw else _fmt_records(atoms)
+
     if cmd == "entity":
         if not args:
-            return "usage: entity <entity_id>"
-        ids = _dedup(idx.by_entity_id.get(_norm_id(args[0]), []))
-        if raw_metta:
-            return _fmt_raw_atoms(idx, ids)
-        return _q_entity(idx, args)
-    return f"unknown command: {cmd}\n{_help_text()}"
+            return "usage: entity <id>"
+        atoms = _atoms_for_entity(idx, args[0])
+        return _fmt_raw(atoms) if raw else _fmt_records(atoms)
 
-# Path-finding algorithm:
-#   1. Build an adjacency map: entity_id → [atom_ids that mention it]
-#   2. BFS from src_id, expanding to all entity_ids that appear in those atoms
-#   3. Stop when dst_id is reached or max_hops exceeded
-#   4. Backtrack to extract the edge atoms along the shortest path
-#   5. Return those atoms as raw MeTTa s-expressions
-
-def _build_adjacency(idx: BioIndex) -> Dict[str, Set[str]]:
-    """entity_id (normalised) → set of entity_ids co-occurring in the same atom."""
-    adj: Dict[str, Set[str]] = defaultdict(set)
-    for atom in idx.atoms:
-        nids = [_norm_id(ei) for _, ei in atom.entities]
-        for nid in nids:
-            for other in nids:
-                if other != nid:
-                    adj[nid].add(other)
-    return adj
+    return f"unknown command: {cmd}\n{_help()}"
 
 
-def _bfs_path(adjacency: Dict[str, Set[str]], src: str, dst: str,
-              max_hops: int = 5) -> Optional[List[str]]:
-    """Return the shortest entity-id path from src to dst, or None."""
-    if src == dst:
-        return [src]
-    visited = {src}
-    # queue of paths
-    queue = [[src]]
+# ---------------------------------------------------------------------------
+# Demand-driven BFS (never builds a full adjacency map)
+# ---------------------------------------------------------------------------
+
+def _neighbors(idx: HotIndex, entity_id: str) -> Set[str]:
+    norm_id = _norm(entity_id)
+    neighbors: Set[str] = set()
+    for fp in idx.entity_to_files.get(norm_id, set()):
+        group, kind = _resolve_file_meta(idx, fp)
+        for atom in _parse_file(fp, group, kind):
+            atom_nids = {_norm(ei) for _, ei in atom.entities}
+            if norm_id in atom_nids:
+                neighbors.update(atom_nids - {norm_id})
+    return neighbors
+
+
+def _bfs(idx: HotIndex, src: str, dst: str, max_hops: int) -> Optional[List[str]]:
+    src_n, dst_n = _norm(src), _norm(dst)
+    if src_n == dst_n:
+        return [src_n]
+    visited = {src_n}
+    queue: List[List[str]] = [[src_n]]
     while queue:
         path = queue.pop(0)
         if len(path) > max_hops:
             return None
-        current = path[-1]
-        for neighbour in adjacency.get(current, set()):
-            if neighbour == dst:
-                return path + [dst]
-            if neighbour not in visited:
-                visited.add(neighbour)
-                queue.append(path + [neighbour])
+        for nb in _neighbors(idx, path[-1]):
+            if nb == dst_n:
+                return path + [dst_n]
+            if nb not in visited:
+                visited.add(nb)
+                queue.append(path + [nb])
     return None
 
 
-def _atoms_on_edge(idx: BioIndex, id_a: str, id_b: str) -> List[int]:
-    """Return atom_ids where both id_a and id_b appear as entities."""
-    set_a = set(idx.by_entity_id.get(id_a, []))
-    set_b = set(idx.by_entity_id.get(id_b, []))
-    return list(set_a & set_b)
+def _edge_atoms(idx: HotIndex, id_a: str, id_b: str) -> List[Atom]:
+    na, nb = _norm(id_a), _norm(id_b)
+    result: List[Atom] = []
+    seen_raw: Set[str] = set()
+    for fp in idx.entity_to_files.get(na, set()):
+        group, kind = _resolve_file_meta(idx, fp)
+        for atom in _parse_file(fp, group, kind):
+            if atom.raw in seen_raw:
+                continue
+            nids = {_norm(ei) for _, ei in atom.entities}
+            if na in nids and nb in nids:
+                seen_raw.add(atom.raw)
+                result.append(atom)
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def bio_index(root: str) -> str:
-    """Build or reuse the full in-memory index for *root*. Returns a summary string."""
     try:
-        idx = _ensure_index(root, force=False)
-        return _fmt_summary(idx)
+        idx = _ensure(root)
+        return (
+            f"indexed root={idx.root} files={idx.file_count} atoms={idx.atom_count} "
+            f"relations={len(idx.folder_counts)} predicates={len(idx.head_counts)}"
+        )
     except Exception as exc:
         return f"bio_index error: {exc}"
 
 
 def bio_reindex(root: str) -> str:
-    """Force-rebuild the index for *root*, bypassing the signature cache."""
     try:
-        idx = _ensure_index(root, force=True)
-        return _fmt_summary(idx)
+        idx = _ensure(root, force=True)
+        return (
+            f"indexed root={idx.root} files={idx.file_count} atoms={idx.atom_count} "
+            f"relations={len(idx.folder_counts)} predicates={len(idx.head_counts)}"
+        )
     except Exception as exc:
         return f"bio_reindex error: {exc}"
 
 
 def bio_query(root: str, query: str) -> str:
-    """Run a structured query against the full index"""
     try:
-        idx = _ensure_index(root, force=False)
-        return _dispatch(idx, query, raw_metta=False)
+        return _dispatch(_ensure(root), query, raw=False)
     except Exception as exc:
         return f"bio_query error: {exc}"
 
 
 def bio_extract(root: str, query: str) -> str:
-    """Like bio_query but returns raw MeTTa s-expressions for symbolic injection.
-
-    The output can be fed directly into the ``metta`` skill to assert facts
-    to run PLN / NAL inference over them.
-    """
     try:
-        idx = _ensure_index(root, force=False)
-        return _dispatch(idx, query, raw_metta=True)
+        return _dispatch(_ensure(root), query, raw=True)
     except Exception as exc:
         return f"bio_extract error: {exc}"
 
 
 def bio_path(root: str, src_id: str, dst_id: str, max_hops: int = 5) -> str:
-    """BFS shortest path between two biological entities."""
     try:
-        idx = _ensure_index(root, force=False)
+        idx = _ensure(root)
     except Exception as exc:
         return f"bio_path error: {exc}"
 
-    src_norm = _norm_id(src_id)
-    dst_norm = _norm_id(dst_id)
+    if _norm(src_id) not in idx.entity_to_files:
+        return f"bio_path: source '{src_id}' not found"
+    if _norm(dst_id) not in idx.entity_to_files:
+        return f"bio_path: destination '{dst_id}' not found"
 
-    if src_norm not in idx.by_entity_id:
-        return f"bio_path: source entity '{src_id}' not found in index"
-    if dst_norm not in idx.by_entity_id:
-        return f"bio_path: destination entity '{dst_id}' not found in index"
-
-    adjacency = _build_adjacency(idx)
-    path = _bfs_path(adjacency, src_norm, dst_norm, max_hops=int(max_hops))
-
+    path = _bfs(idx, src_id, dst_id, max_hops=int(max_hops))
     if path is None:
-        return f"bio_path: no path found between '{src_id}' and '{dst_id}' within {max_hops} hops"
+        return f"bio_path: no path within {max_hops} hops between '{src_id}' and '{dst_id}'"
 
-    # Collect edge atoms for each hop
-    all_atom_ids: List[int] = []
-    seen_aids: Set[int] = set()
+    atoms: List[Atom] = []
+    seen: Set[str] = set()
     for i in range(len(path) - 1):
-        edge_aids = _atoms_on_edge(idx, path[i], path[i + 1])
-        for aid in edge_aids:
-            if aid not in seen_aids:
-                seen_aids.add(aid)
-                all_atom_ids.append(aid)
+        for atom in _edge_atoms(idx, path[i], path[i + 1]):
+            if atom.raw not in seen:
+                seen.add(atom.raw)
+                atoms.append(atom)
 
     header = f"; bio-path {src_id} -> {dst_id}  hops={len(path)-1}  via={' -> '.join(path)}"
-    body = _fmt_raw_atoms(idx, all_atom_ids)
+    body = _fmt_raw(atoms)
     return f"{header}\n{body}" if body else f"{header}\n; (no connecting atoms found)"

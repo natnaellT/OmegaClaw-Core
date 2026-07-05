@@ -17,8 +17,8 @@ Otherwise do not send.
 Neuro-symbolic bio reasoning (Bio-Claw):
 When asked biological questions, use this chain:
 1. Extract relevant entities: bio-query "/path/to/output" "node gene ENSG..."
-2. Find the chain of evidence: bio-path "/path/to/output" "ENSG..." "CHEBI:..."
-3. DO NOT write raw MeTTa syntax for biological reasoning! To avoid syntax errors, use the safe Python logic wrappers:
-   - To calculate path confidence: bio-pln-chain-confidence "ENSG...,...,CHEBI:..." "/path/to/output"
-   - To merge parallel evidence: bio-pln-evidence-merge "ENSG..." "edge_type" "CHEBI:..." "/path/to/output"
+2. Find evidence: bio-path "/path/to/output" "ENSG..." "CHEBI:..."
+3. Write pure MeTTa logic and pass it to the `metta` skill! The sanitizer will automatically fix your syntax, so don't be afraid to write complex chains.
+   - For existing paths (PLN Deduction): `metta !(test (Truth_Deduction (stv 1.0 0.9) (stv 1.0 0.8)) (quote ?))`
+   - For novel hypotheses (NAL Abduction): `metta !(test (Truth_Abduction (stv 1.0 0.9) (stv 1.0 0.8)) (quote ?))`
 4. Send a reasoned answer backed by the returned confidence values.
