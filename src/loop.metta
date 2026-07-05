@@ -6,12 +6,12 @@
 (= (maxOutputToken) (empty))
 (= (reasoningMode) (empty))
 (= (wakeupInterval) (empty))
-(= (spamShield) (empty))
+(= (spamShield) (empty)) ; TODO: this parameter is considered deprecated
 
 (= (initLoop)
    (progn (configure maxNewInputLoops 50) ;20
           (configure maxWakeLoops 1)
-          (configure spamShield True)
+          (configure spamShield False)
           (configure sleepInterval 1) ;10
           (configure LLM gpt-5.4)
           (configure provider Anthropic) ;Anthropic or OpenAI or ASICloud or ASIOne or Test
@@ -22,8 +22,14 @@
           (change-state! &lastresults "")
           (change-state! &loops (maxNewInputLoops))))
 
+(= (initKnowledge)
+   (progn (println! "Initializing knowledge base")
+          (if (== (embeddingprovider) OpenAI)
+              (println! (py-call (rag.init_knowledge "OpenAI")))
+              (println! (py-call (rag.init_knowledge "Local"))))))
+
 (= (getContext)
-   (string-safe (py-str ("PROMPT: " (getPrompt) " SKILLS: " (getSkills)
+   (string-safe (py-str ("PROMPT: " (getPrompt (provider)) " SKILLS: " (getSkills)
                          " OUTPUT_FORMAT: Up to 5 lines, do not wrap quotes around args, do not use variables:" (newline)
                          " toolName1 arg1" (newline)
                          " toolName2 arg2" (newline)
@@ -41,7 +47,9 @@
    (omegaclaw 1))
 (= (omegaclaw $k)
    (progn (if (== $k 1) (progn (initLoop)
+                               (applySecurityPolicy)
                                (initMemory)
+                               (initKnowledge)
                                (initChannels))
                         (change-state! &loops (- (get-state &loops) 1)))
           (let $prompt (getContext)

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # For maximum integrity, set this to an immutable digest in CI/CD.
-ARG SWIPL_IMAGE=docker.io/library/swipl:9.2.4
+ARG SWIPL_IMAGE=docker.io/library/swipl:10.0.2
 
 FROM ${SWIPL_IMAGE} AS builder
 
@@ -55,7 +55,8 @@ RUN mkdir -p /PeTTa/repos \
 COPY ./requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
     --index-url https://download.pytorch.org/whl/cpu \
-    torch==2.5.1 \
+    --extra-index-url https://pypi.org/simple/ \
+    torch==2.12.1 \
  && python3 -m pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # Pre-download the sentence-transformers model so runtime does not need network access.
@@ -90,6 +91,8 @@ RUN apt-get update \
       git \
       nginx-light \
       gettext-base \
+      poppler-utils \
+      curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /PeTTa
@@ -108,6 +111,8 @@ COPY --chown=www-data:www-data --chmod=0600 ./proxy/* /opt/nginx/
 
 ENV OMEGACLAW_DIR=/PeTTa/repos/OmegaClaw-Core
 ENV MEMORY_DIR=${OMEGACLAW_DIR}/memory
+# Start defaults for import-kb
+ENV IMPORT_KB_ON_START=0
 
 # Bring in only local OmegaClaw source (filtered by .dockerignore).
 COPY . ${OMEGACLAW_DIR}
@@ -115,10 +120,12 @@ COPY . ${OMEGACLAW_DIR}
 RUN cp ${OMEGACLAW_DIR}/run.metta /PeTTa/run.metta \
  && mkdir -p ${MEMORY_DIR}/chroma_db \
  && ln -s ${MEMORY_DIR}/chroma_db ./chroma_db \
+ && chmod +x ${OMEGACLAW_DIR}/entrypoint.sh \
+ && chmod +x ${OMEGACLAW_DIR}/scripts/import_knowledge.sh \
  && chown -R 65534:65534 ${MEMORY_DIR} \
  && find ${MEMORY_DIR} -type f -exec chmod 0644 {} \; \
  && chmod 0444 ${MEMORY_DIR}/prompt.txt \
  && chown -R 65534:65534 /opt/huggingface /opt/sentence_transformers
 
-ENTRYPOINT ["sh", "/PeTTa/repos/OmegaClaw-Core/entrypoint.sh"]
+ENTRYPOINT ["/PeTTa/repos/OmegaClaw-Core/entrypoint.sh"]
 CMD []
