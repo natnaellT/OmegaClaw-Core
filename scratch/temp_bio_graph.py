@@ -1,9 +1,9 @@
-"""Bio-Claw v2 — Production-grade biological knowledge graph engine.
+"""Bio-Claw v3 — Production-grade biological knowledge graph engine.
 
 Three-tier lazy architecture
 ============================
-  Tier 0  Discovery    subprocess ``find`` — WSL / DrvFs safe
-  Tier 1  SQLite Index  regex-scanned entity/head pointers
+  Tier 0  Discovery    bin/bio-index (outside janus sandbox)
+  Tier 1  SQLite Index  regex-scanned entity/head pointers (lean dictionary mapping)
                         persistent on disk, incremental per-file invalidation
   Tier 2  Demand Parse  full S-expr parsing only for atoms a query touches
                         byte-offset zero-copy retrieval from source files
@@ -179,9 +179,6 @@ def _extract_head(raw: str) -> str:
     return raw[i:j] if j > i else "_unknown"
 
 
-# Matches leaf-level (type id) pairs — intentionally broad.
-# False positives are harmless: the index is a superset; queries
-# always validate via full Tier-2 parse.
 _ENTITY_RE = re.compile(r"\(([a-zA-Z_]\w*)\s+([^\s()]+)\)")
 
 
@@ -190,35 +187,31 @@ _ENTITY_RE = re.compile(r"\(([a-zA-Z_]\w*)\s+([^\s()]+)\)")
 # ───────────────────────────────────────────────────────────────────
 
 class _Engine:
-    """Singleton managing the three-tier lifecycle.
+    """Singleton managing the lifecycle."""
 
-    Usage::
-
-        _E.bind("/path/to/output")       # discover + index (lazy)
-        _E.query_entity("ENSG00000141510")  # on-demand parse
-    """
-
-    __slots__ = ("root", "_db_path", "_conn", "_meta")
+    __slots__ = ("root", "_db_path", "_conn", "_dict_cache", "_readonly")
 
     def __init__(self) -> None:
         self.root: Optional[str] = None
         self._db_path: Optional[str] = None
         self._conn: Optional[sqlite3.Connection] = None
-        self._meta: Dict[str, Tuple[str, str]] = {}     # path → (group, kind)
+        self._dict_cache: Dict[str, int] = {}
+        self._readonly: bool = True
 
-    # ── lifecycle ──────────────────────────────────────────────────
-
-    def bind(self, root: str, force: bool = False) -> Stats:
-        """Attach to *root*, building / refreshing the index as needed."""
+    def bind(self, root: str, force: bool = False, readonly: bool = True) -> None:
+        """Attach to *root*. If force is True, we allow missing index for building."""
         aroot = os.path.abspath(root)
         if not os.path.isdir(aroot):
             raise ValueError(f"Output folder not found: '{root}'")
-        if self.root != aroot or force:
+        if self.root != aroot or self._readonly != readonly:
             self._close()
             self.root = aroot
+            self._readonly = readonly
             self._db_path = os.path.join(aroot, ".bioclaw.db")
-            self._meta.clear()
-        return self._sync(force)
+            if not force and not os.path.exists(self._db_path):
+                raise RuntimeError(
+                    f"Index missing for {root}. Please run `bin/bio-index` to build it."
+                )
 
     def _close(self) -> None:
         if self._conn is not None:
@@ -227,20 +220,33 @@ class _Engine:
             except Exception:
                 pass
             self._conn = None
+        self._dict_cache.clear()
 
     @property
     def db(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(self._db_path, timeout=10)
-            self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA synchronous  = NORMAL")
-            self._conn.execute("PRAGMA cache_size   = -16000")   # 16 MB
-            self._conn.execute("PRAGMA temp_store   = MEMORY")
-            self._init_schema()
+            if self._readonly and os.path.exists(self._db_path):
+                self._conn = sqlite3.connect(
+                    f"file:{self._db_path}?immutable=1",
+                    uri=True, timeout=10,
+                )
+                self._conn.execute("PRAGMA cache_size = -16000")
+                self._conn.execute("PRAGMA temp_store = MEMORY")
+            else:
+                self._conn = sqlite3.connect(self._db_path, timeout=10)
+                self._conn.execute("PRAGMA journal_mode = WAL")
+                self._conn.execute("PRAGMA synchronous  = NORMAL")
+                self._conn.execute("PRAGMA cache_size   = -16000")
+                self._conn.execute("PRAGMA temp_store   = MEMORY")
+                self._init_schema()
         return self._conn
 
     def _init_schema(self) -> None:
         self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS dict (
+                did INTEGER PRIMARY KEY,
+                val TEXT UNIQUE COLLATE NOCASE
+            );
             CREATE TABLE IF NOT EXISTS files (
                 fid  INTEGER PRIMARY KEY AUTOINCREMENT,
                 path TEXT UNIQUE NOT NULL,
@@ -253,72 +259,58 @@ class _Engine:
             CREATE TABLE IF NOT EXISTS atoms (
                 aid  INTEGER PRIMARY KEY AUTOINCREMENT,
                 fid  INTEGER NOT NULL,
-                head TEXT    NOT NULL,
+                hid  INTEGER NOT NULL,
                 ln   INTEGER NOT NULL,
                 off  INTEGER NOT NULL,
                 blen INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ents (
                 aid   INTEGER NOT NULL,
-                etype TEXT    NOT NULL,
-                eid   TEXT    NOT NULL,
-                eid_l TEXT    NOT NULL
+                tid   INTEGER NOT NULL,
+                eid   TEXT    NOT NULL COLLATE NOCASE
             );
-            CREATE INDEX IF NOT EXISTS ix_eid   ON ents  (eid_l);
-            CREATE INDEX IF NOT EXISTS ix_etype ON ents  (etype, eid_l);
-            CREATE INDEX IF NOT EXISTS ix_head  ON atoms (head);
-            CREATE INDEX IF NOT EXISTS ix_afid  ON atoms (fid);
-            CREATE INDEX IF NOT EXISTS ix_eaid  ON ents  (aid);
+            CREATE INDEX IF NOT EXISTS ix_eid  ON ents (eid);
+            CREATE INDEX IF NOT EXISTS ix_tid  ON ents (tid, eid);
+            CREATE INDEX IF NOT EXISTS ix_hid  ON atoms (hid);
+            CREATE INDEX IF NOT EXISTS ix_afid ON atoms (fid);
+            CREATE INDEX IF NOT EXISTS ix_eaid ON ents (aid);
         """)
 
-    # ── Tier 0: discovery (WSL-safe) ──────────────────────────────
+    def _get_did(self, val: str) -> int:
+        if val not in self._dict_cache:
+            row = self.db.execute("SELECT did FROM dict WHERE val=? COLLATE NOCASE", (val,)).fetchone()
+            if row:
+                self._dict_cache[val] = row[0]
+            else:
+                self.db.execute("INSERT INTO dict (val) VALUES (?)", (val,))
+                self._dict_cache[val] = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return self._dict_cache[val]
 
     def _discover(self) -> List[Tuple[str, str, str]]:
-        """Return [(abs_path, group, kind), …] for every .metta file."""
         import glob
         paths = glob.glob(os.path.join(self.root, "**", "*.metta"), recursive=True)
         paths.sort()
-
         specs: List[Tuple[str, str, str]] = []
         for fp in paths:
             rel = os.path.relpath(os.path.dirname(fp), self.root)
             grp = rel.split(os.sep, 1)[0] if rel != "." else "_root"
             kind = os.path.splitext(os.path.basename(fp))[0].lower()
             specs.append((fp, grp, kind))
-            self._meta[fp] = (grp, kind)
-            
-        if not specs:
-            # Let's write debug info to a file so we can see what went wrong
-            with open("/tmp/bio_graph_debug.txt", "w") as f:
-                f.write(f"root: {self.root}\n")
-                f.write(f"isdir: {os.path.isdir(self.root)}\n")
-                if os.path.isdir(self.root):
-                    f.write(f"listdir: {os.listdir(self.root)[:10]}\n")
-            raise ValueError(f"No .metta files found under '{self.root}'. (See /tmp/bio_graph_debug.txt)")
-            
         return specs
 
-    # ── Tier 1: incremental SQLite indexing ───────────────────────
-
     def _sync(self, force: bool = False) -> Stats:
-        """Synchronise the index with the filesystem."""
         specs = self._discover()
         if not specs:
-            raise ValueError(
-                f"No .metta files found under '{self.root}'"
-            )
+            raise ValueError(f"No .metta files found under '{self.root}'")
 
         db = self.db
-
-        # What is already indexed?
-        indexed: Dict[str, Tuple[int, float, int]] = {}   # path → (sz, mt, fid)
+        indexed: Dict[str, Tuple[int, float, int]] = {}
         if not force:
             for row in db.execute("SELECT path, sz, mt, fid FROM files"):
                 indexed[row[0]] = (row[1], row[2], row[3])
         else:
-            db.executescript(
-                "DELETE FROM ents; DELETE FROM atoms; DELETE FROM files;"
-            )
+            db.executescript("DELETE FROM ents; DELETE FROM atoms; DELETE FROM files; DELETE FROM dict;")
+            self._dict_cache.clear()
 
         current_paths: Set[str] = set()
         to_scan: List[Tuple[str, str, str, Tuple[int, float]]] = []
@@ -330,60 +322,38 @@ class _Engine:
                 sig = (st.st_size, st.st_mtime)
             except OSError:
                 continue
-            if (force
-                    or fp not in indexed
-                    or indexed[fp][:2] != sig):
+            if force or fp not in indexed or indexed[fp][:2] != sig:
                 to_scan.append((fp, grp, kind, sig))
 
-        # Prune files that no longer exist on disk
         if not force:
             deleted = set(indexed) - current_paths
             for dp in deleted:
                 fid = indexed[dp][2]
-                db.execute(
-                    "DELETE FROM ents WHERE aid IN "
-                    "(SELECT aid FROM atoms WHERE fid=?)", (fid,))
+                db.execute("DELETE FROM ents WHERE aid IN (SELECT aid FROM atoms WHERE fid=?)", (fid,))
                 db.execute("DELETE FROM atoms WHERE fid=?", (fid,))
                 db.execute("DELETE FROM files WHERE fid=?", (fid,))
             if deleted:
                 db.commit()
 
-        # Index new / changed files
         for fp, grp, kind, sig in to_scan:
             self._scan_file(fp, grp, kind, sig)
+        
         if to_scan:
             db.commit()
+            db.execute("VACUUM")
+            self._close() # Reopen cleanly
 
         return self._get_stats()
 
-    def _scan_file(
-        self,
-        path: str,
-        grp: str,
-        kind: str,
-        sig: Tuple[int, float],
-    ) -> None:
-        """Regex-scan a single file into the SQLite index.
-
-        Works directly on raw bytes so that stored byte-offsets are
-        exact for later zero-copy retrieval.  Comment and string
-        tracking prevents false paren-depth changes.
-        """
+    def _scan_file(self, path: str, grp: str, kind: str, sig: Tuple[int, float]) -> None:
         db = self.db
-
-        # Evict stale entry
-        old = db.execute(
-            "SELECT fid FROM files WHERE path=?", (path,)
-        ).fetchone()
+        old = db.execute("SELECT fid FROM files WHERE path=?", (path,)).fetchone()
         if old:
             fid = old[0]
-            db.execute(
-                "DELETE FROM ents WHERE aid IN "
-                "(SELECT aid FROM atoms WHERE fid=?)", (fid,))
+            db.execute("DELETE FROM ents WHERE aid IN (SELECT aid FROM atoms WHERE fid=?)", (fid,))
             db.execute("DELETE FROM atoms WHERE fid=?", (fid,))
             db.execute("DELETE FROM files WHERE fid=?", (fid,))
 
-        # Read raw bytes (byte offsets stay exact)
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
@@ -391,82 +361,59 @@ class _Engine:
             return
 
         db.execute(
-            "INSERT INTO files (path, grp, kind, sz, mt) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO files (path, grp, kind, sz, mt) VALUES (?,?,?,?,?)",
             (path, grp, kind, sig[0], sig[1]),
         )
         fid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        # ── single-pass byte scan ─────────────────────────────────
-        atom_rows: List[Tuple[int, str, int, int, int]] = []
-        atom_ents: List[List[Tuple[str, str, str]]] = []
+        atom_rows: List[Tuple[int, int, int, int, int]] = []
+        atom_ents: List[List[Tuple[int, str]]] = []
 
-        depth      = 0
-        start      = -1
-        start_ln   = 1
-        ln         = 1
+        depth = 0
+        start = -1
+        start_ln = 1
+        ln = 1
         in_comment = False
-        in_str     = False
-        escaped    = False
-        n          = len(data)
+        in_str = False
+        escaped = False
+        n = len(data)
 
         for i in range(n):
             b = data[i]
-
-            # ── newline ───────────────────────────────────────────
-            if b == 0x0A:                           # '\n'
+            if b == 0x0A:
                 ln += 1
                 in_comment = False
                 continue
-
-            # ── inside comment — skip until newline ───────────────
-            if in_comment:
-                continue
-
-            # ── inside string literal ─────────────────────────────
+            if in_comment: continue
             if in_str:
-                if escaped:
-                    escaped = False
-                elif b == 0x5C:                     # '\\'
-                    escaped = True
-                elif b == 0x22:                     # '"'
-                    in_str = False
-                continue                            # parens inside strings are inert
-
-            # ── comment start ─────────────────────────────────────
-            if b == 0x3B:                           # ';'
+                if escaped: escaped = False
+                elif b == 0x5C: escaped = True
+                elif b == 0x22: in_str = False
+                continue
+            if b == 0x3B:
                 in_comment = True
                 continue
-
-            # ── string start ──────────────────────────────────────
-            if b == 0x22:                           # '"'
+            if b == 0x22:
                 in_str = True
                 continue
-
-            # ── parenthesis tracking ──────────────────────────────
-            if b == 0x28:                           # '('
+            if b == 0x28:
                 if depth == 0:
-                    start    = i
+                    start = i
                     start_ln = ln
                 depth += 1
-
-            elif b == 0x29 and depth > 0:           # ')'
+            elif b == 0x29 and depth > 0:
                 depth -= 1
                 if depth == 0 and start >= 0:
                     blen = i + 1 - start
-                    raw_text = data[start : i + 1].decode(
-                        "utf-8", errors="replace"
-                    )
-                    # Strip inline comments for extraction accuracy
+                    raw_text = data[start : i + 1].decode("utf-8", errors="replace")
                     clean = _strip_comments(raw_text)
-                    head  = _extract_head(clean)
+                    
+                    head = _extract_head(clean)
+                    hid = self._get_did(head)
+                    atom_rows.append((fid, hid, start_ln, start, blen))
 
-                    atom_rows.append(
-                        (fid, head, start_ln, start, blen)
-                    )
-
-                    ents: List[Tuple[str, str, str]] = [
-                        (m.group(1), m.group(2), m.group(2).lower())
+                    ents: List[Tuple[int, str]] = [
+                        (self._get_did(m.group(1)), m.group(2))
                         for m in _ENTITY_RE.finditer(clean)
                     ]
                     atom_ents.append(ents)
@@ -476,38 +423,25 @@ class _Engine:
             db.execute("UPDATE files SET ac=0 WHERE fid=?", (fid,))
             return
 
-        # ── batch insert atoms ────────────────────────────────────
         db.executemany(
-            "INSERT INTO atoms (fid, head, ln, off, blen) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO atoms (fid, hid, ln, off, blen) VALUES (?,?,?,?,?)",
             atom_rows,
         )
-        last_aid  = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        last_aid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         first_aid = last_aid - len(atom_rows) + 1
 
-        # ── batch insert entity refs ──────────────────────────────
-        ent_rows: List[Tuple[int, str, str, str]] = []
+        ent_rows: List[Tuple[int, int, str]] = []
         for idx, ents in enumerate(atom_ents):
             aid = first_aid + idx
-            for etype, eid, eid_l in ents:
-                ent_rows.append((aid, etype, eid, eid_l))
+            for tid, eid in ents:
+                ent_rows.append((aid, tid, eid))
 
         if ent_rows:
-            db.executemany(
-                "INSERT INTO ents (aid, etype, eid, eid_l) "
-                "VALUES (?,?,?,?)",
-                ent_rows,
-            )
+            db.executemany("INSERT INTO ents (aid, tid, eid) VALUES (?,?,?)", ent_rows)
 
-        db.execute(
-            "UPDATE files SET ac=? WHERE fid=?",
-            (len(atom_rows), fid),
-        )
-
-    # ── Tier 2: zero-copy retrieval + on-demand parse ─────────────
+        db.execute("UPDATE files SET ac=? WHERE fid=?", (len(atom_rows), fid))
 
     def _read_raw(self, path: str, off: int, blen: int) -> str:
-        """Read a single raw atom from disk by byte offset — O(1)."""
         try:
             with open(path, "rb") as fh:
                 fh.seek(off)
@@ -515,18 +449,13 @@ class _Engine:
         except OSError:
             return ""
 
-    def _to_atom(
-        self, raw: str, grp: str, kind: str, ln: int,
-    ) -> Optional[Atom]:
-        """Full S-expression parse of a single atom (Tier 2)."""
+    def _to_atom(self, raw: str, grp: str, kind: str, ln: int) -> Optional[Atom]:
         clean = _strip_comments(raw)
         try:
             parsed = _parse_term(_tokenize(clean))[0]
         except (ValueError, IndexError):
             return None
-        if (not isinstance(parsed, list)
-                or not parsed
-                or not isinstance(parsed[0], str)):
+        if not isinstance(parsed, list) or not parsed or not isinstance(parsed[0], str):
             return None
         ents: Set[Tuple[str, str]] = set()
         _collect_entities(parsed, ents)
@@ -539,11 +468,7 @@ class _Engine:
             line=ln,
         )
 
-    def _rows_to_atoms(
-        self,
-        rows: List[Tuple[str, str, str, int, int, int]],
-    ) -> List[Atom]:
-        """Hydrate SQL result rows into fully-parsed Atom objects."""
+    def _rows_to_atoms(self, rows: List[Tuple[str, str, str, int, int, int]]) -> List[Atom]:
         atoms: List[Atom] = []
         for path, grp, kind, ln, off, blen in rows:
             raw = self._read_raw(path, off, blen)
@@ -553,50 +478,40 @@ class _Engine:
                     atoms.append(atom)
         return atoms
 
-    # ── query methods ─────────────────────────────────────────────
-
-    def query_entity(
-        self,
-        eid: str,
-        etype: Optional[str] = None,
-        limit: int = RAW_LIMIT,
-    ) -> List[Atom]:
-        eid_l = eid.strip().lower()
+    def query_entity(self, eid: str, etype: Optional[str] = None, limit: int = RAW_LIMIT) -> List[Atom]:
         if etype:
             rows = self.db.execute("""
                 SELECT DISTINCT f.path, f.grp, f.kind, a.ln, a.off, a.blen
                 FROM   ents e
                 JOIN   atoms a ON e.aid = a.aid
                 JOIN   files f ON a.fid = f.fid
-                WHERE  e.eid_l = ? AND LOWER(e.etype) = ?
+                JOIN   dict d  ON e.tid = d.did
+                WHERE  e.eid = ? AND d.val = ? COLLATE NOCASE
                 LIMIT  ?
-            """, (eid_l, etype.strip().lower(), limit)).fetchall()
+            """, (eid, etype, limit)).fetchall()
         else:
             rows = self.db.execute("""
                 SELECT DISTINCT f.path, f.grp, f.kind, a.ln, a.off, a.blen
                 FROM   ents e
                 JOIN   atoms a ON e.aid = a.aid
                 JOIN   files f ON a.fid = f.fid
-                WHERE  e.eid_l = ?
+                WHERE  e.eid = ? COLLATE NOCASE
                 LIMIT  ?
-            """, (eid_l, limit)).fetchall()
+            """, (eid, limit)).fetchall()
         return self._rows_to_atoms(rows)
 
-    def query_head(
-        self, head: str, limit: int = RAW_LIMIT,
-    ) -> List[Atom]:
+    def query_head(self, head: str, limit: int = RAW_LIMIT) -> List[Atom]:
         rows = self.db.execute("""
             SELECT f.path, f.grp, f.kind, a.ln, a.off, a.blen
             FROM   atoms a
             JOIN   files f ON a.fid = f.fid
-            WHERE  a.head = ?
+            JOIN   dict d  ON a.hid = d.did
+            WHERE  d.val = ? COLLATE NOCASE
             LIMIT  ?
         """, (head, limit)).fetchall()
         return self._rows_to_atoms(rows)
 
-    def query_folder(
-        self, grp: str, limit: int = RAW_LIMIT,
-    ) -> List[Atom]:
+    def query_folder(self, grp: str, limit: int = RAW_LIMIT) -> List[Atom]:
         rows = self.db.execute("""
             SELECT f.path, f.grp, f.kind, a.ln, a.off, a.blen
             FROM   atoms a
@@ -607,34 +522,29 @@ class _Engine:
         return self._rows_to_atoms(rows)
 
     def neighbors(self, eid: str) -> Set[str]:
-        """All entities co-occurring with *eid* in any atom (SQL JOIN)."""
-        eid_l = eid.strip().lower()
         rows = self.db.execute("""
-            SELECT DISTINCT e2.eid_l
+            SELECT DISTINCT e2.eid
             FROM   ents e1
             JOIN   ents e2 ON e1.aid = e2.aid
-            WHERE  e1.eid_l = ? AND e2.eid_l != ?
-        """, (eid_l, eid_l)).fetchall()
-        return {r[0] for r in rows}
+            WHERE  e1.eid = ? COLLATE NOCASE AND e2.eid != ? COLLATE NOCASE
+        """, (eid, eid)).fetchall()
+        return {r[0].lower() for r in rows}
 
     def has_entity(self, eid: str) -> bool:
         return self.db.execute(
-            "SELECT 1 FROM ents WHERE eid_l = ? LIMIT 1",
-            (eid.strip().lower(),),
+            "SELECT 1 FROM ents WHERE eid = ? COLLATE NOCASE LIMIT 1",
+            (eid,),
         ).fetchone() is not None
 
     def edge_atoms(self, id_a: str, id_b: str) -> List[Atom]:
-        """Atoms containing *both* entities (for path rendering)."""
-        na = id_a.strip().lower()
-        nb = id_b.strip().lower()
         rows = self.db.execute("""
             SELECT DISTINCT f.path, f.grp, f.kind, ax.ln, ax.off, ax.blen
             FROM   ents e1
             JOIN   ents e2 ON e1.aid = e2.aid
             JOIN   atoms ax ON e1.aid = ax.aid
             JOIN   files f  ON ax.fid = f.fid
-            WHERE  e1.eid_l = ? AND e2.eid_l = ?
-        """, (na, nb)).fetchall()
+            WHERE  e1.eid = ? COLLATE NOCASE AND e2.eid = ? COLLATE NOCASE
+        """, (id_a, id_b)).fetchall()
 
         atoms: List[Atom] = []
         seen: Set[str] = set()
@@ -647,235 +557,194 @@ class _Engine:
                     atoms.append(atom)
         return atoms
 
-    # ── stats ─────────────────────────────────────────────────────
-
     def _get_stats(self) -> Stats:
         db = self.db
         fc = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        ac = db.execute(
-            "SELECT COALESCE(SUM(ac), 0) FROM files"
-        ).fetchone()[0]
+        ac = db.execute("SELECT COALESCE(SUM(ac), 0) FROM files").fetchone()[0]
         groups = dict(db.execute(
-            "SELECT grp, SUM(ac) FROM files "
-            "GROUP BY grp ORDER BY SUM(ac) DESC"
+            "SELECT grp, SUM(ac) FROM files GROUP BY grp ORDER BY SUM(ac) DESC"
         ).fetchall())
-        heads = dict(db.execute(
-            "SELECT head, COUNT(*) FROM atoms "
-            "GROUP BY head ORDER BY COUNT(*) DESC LIMIT 30"
-        ).fetchall())
+        
+        # Heads logic updated to use dict table
+        heads = dict(db.execute("""
+            SELECT d.val, COUNT(a.aid) 
+            FROM atoms a JOIN dict d ON a.hid = d.did 
+            GROUP BY d.val ORDER BY COUNT(a.aid) DESC LIMIT 30
+        """).fetchall())
+        
         return Stats(
             root=self.root, files=fc, atoms=ac,
             groups=groups, heads=heads,
         )
 
-
-# ── singleton ─────────────────────────────────────────────────────
-
 _E = _Engine()
-
 
 # ───────────────────────────────────────────────────────────────────
 # Formatters
 # ───────────────────────────────────────────────────────────────────
 
 def _fmt(atoms: List[Atom], limit: int = DISPLAY_LIMIT) -> str:
-    if not atoms:
-        return "no matches"
+    if not atoms: return "no matches"
     lines = [f"matches={len(atoms)} showing={min(limit, len(atoms))}"]
-    for a in atoms[:limit]:
-        lines.append(f"[{a.group}/{a.kind}]:{a.line} {a.raw}")
-    if len(atoms) > limit:
-        lines.append(f"... {len(atoms) - limit} more")
+    for a in atoms[:limit]: lines.append(f"[{a.group}/{a.kind}]:{a.line} {a.raw}")
+    if len(atoms) > limit: lines.append(f"... {len(atoms) - limit} more")
     return "\n".join(lines)
-
 
 def _fmt_raw(atoms: List[Atom], limit: int = RAW_LIMIT) -> str:
     parts = [a.raw for a in atoms[:limit]]
-    if len(atoms) > limit:
-        parts.append(f"; ... {len(atoms) - limit} more atoms truncated")
+    if len(atoms) > limit: parts.append(f"; ... {len(atoms) - limit} more atoms truncated")
     return "\n".join(parts)
 
-
 def _help() -> str:
-    return (
-        "commands: stats | folders | predicates | "
-        "folder <group> | predicate <name> | "
-        "node <type> <id> | entity <id> | help"
-    )
-
-
-# ───────────────────────────────────────────────────────────────────
-# Query dispatcher
-# ───────────────────────────────────────────────────────────────────
+    return "commands: stats | folders | predicates | folder <group> | predicate <name> | node <type> <id> | entity <id> | help"
 
 def _dispatch(query: str, raw: bool = False) -> str:
-    try:
-        parts = shlex.split(query)
-    except ValueError as exc:
-        return f"parse error: {exc}"
-    if not parts:
-        return _help()
+    try: parts = shlex.split(query)
+    except ValueError as exc: return f"parse error: {exc}"
+    if not parts: return _help()
 
     cmd, args = parts[0].lower(), parts[1:]
     fmt = _fmt_raw if raw else _fmt
 
-    if cmd == "help":
-        return _help()
-
+    if cmd == "help": return _help()
     if cmd == "stats":
         s = _E._get_stats()
-        top_g = " ".join(
-            f"{k}:{v}" for k, v in
-            sorted(s.groups.items(), key=lambda x: -x[1])[:10]
-        )
-        top_h = " ".join(
-            f"{k}:{v}" for k, v in
-            sorted(s.heads.items(), key=lambda x: -x[1])[:10]
-        )
-        return (
-            f"root={s.root} files={s.files} atoms={s.atoms} "
-            f"groups={len(s.groups)} predicates={len(s.heads)}\n"
-            f"top_groups {top_g}\n"
-            f"top_predicates {top_h}"
-        )
-
+        top_g = " ".join(f"{k}:{v}" for k, v in sorted(s.groups.items(), key=lambda x: -x[1])[:10])
+        top_h = " ".join(f"{k}:{v}" for k, v in sorted(s.heads.items(), key=lambda x: -x[1])[:10])
+        return f"root={s.root} files={s.files} atoms={s.atoms} groups={len(s.groups)} predicates={len(s.heads)}\ntop_groups {top_g}\ntop_predicates {top_h}"
     if cmd == "folders":
         s = _E._get_stats()
-        return "\n".join(
-            f"{k} atoms={v}"
-            for k, v in sorted(s.groups.items(), key=lambda x: -x[1])
-        )
-
+        return "\n".join(f"{k} atoms={v}" for k, v in sorted(s.groups.items(), key=lambda x: -x[1]))
     if cmd == "predicates":
         s = _E._get_stats()
-        return "\n".join(
-            f"{k} atoms={v}"
-            for k, v in sorted(s.heads.items(), key=lambda x: -x[1])
-        )
-
+        return "\n".join(f"{k} atoms={v}" for k, v in sorted(s.heads.items(), key=lambda x: -x[1]))
     if cmd == "folder":
-        if not args:
-            return "usage: folder <group>"
+        if not args: return "usage: folder <group>"
         return fmt(_E.query_folder(args[0]))
-
     if cmd == "predicate":
-        if not args:
-            return "usage: predicate <name>"
+        if not args: return "usage: predicate <name>"
         return fmt(_E.query_head(args[0]))
-
     if cmd == "node":
-        if len(args) < 2:
-            return "usage: node <type> <id>"
+        if len(args) < 2: return "usage: node <type> <id>"
         return fmt(_E.query_entity(args[1], args[0]))
-
     if cmd == "entity":
-        if not args:
-            return "usage: entity <id>"
+        if not args: return "usage: entity <id>"
         return fmt(_E.query_entity(args[0]))
 
     return f"unknown command: {cmd}\n{_help()}"
 
-
-# ───────────────────────────────────────────────────────────────────
-# BFS path finding  (uses SQL-backed neighbor lookup)
-# ───────────────────────────────────────────────────────────────────
-
-def _bfs(
-    src: str,
-    dst: str,
-    max_hops: int = BFS_MAX_HOPS,
-) -> Optional[List[str]]:
+def _bfs(src: str, dst: str, max_hops: int = BFS_MAX_HOPS) -> Optional[List[str]]:
     sn, dn = src.strip().lower(), dst.strip().lower()
-    if sn == dn:
-        return [sn]
+    if sn == dn: return [sn]
     visited: Set[str] = {sn}
     queue: List[List[str]] = [[sn]]
     while queue:
         path = queue.pop(0)
-        if len(path) > max_hops:
-            return None
+        if len(path) > max_hops: return None
         for nb in _E.neighbors(path[-1]):
-            if nb == dn:
-                return path + [dn]
+            if nb == dn: return path + [dn]
             if nb not in visited:
                 visited.add(nb)
                 queue.append(path + [nb])
     return None
 
-
 # ───────────────────────────────────────────────────────────────────
-# Public API  (called via py-call from MeTTa skills.metta)
+# Public API
 # ───────────────────────────────────────────────────────────────────
 
 def _root() -> str:
-    """Resolve BioCypher output folder from environment."""
     return os.environ.get("BIOCYPHER_KG_PATH", "./data")
 
+def build_index(root: str, force: bool = False) -> Stats:
+    """Out-of-band indexing method called by bin/bio-index."""
+    _E.bind(root, force=True, readonly=False)
+    return _E._sync(force=force)
 
-def bio_index() -> str:
-    """Build or reuse the persistent index.  Returns summary string."""
+def bio_index(*args) -> str:
+    """Agent entrypoint - now instructs the user/agent to use the CLI.
+    Supports bio_index() and bio_index(root).
+    """
     try:
-        s = _E.bind(_root())
-        return (
-            f"indexed root={s.root} files={s.files} atoms={s.atoms} "
-            f"groups={len(s.groups)} predicates={len(s.heads)}"
-        )
+        return "Please use the 'shell' skill to run: python3 bin/bio-index"
     except Exception as exc:
         return f"bio_index error: {exc}"
 
-
-def bio_reindex() -> str:
-    """Force full rebuild of the index.  Returns summary string."""
+def bio_reindex(*args) -> str:
+    """Agent entrypoint - now instructs the user/agent to use the CLI.
+    Supports bio_reindex() and bio_reindex(root).
+    """
     try:
-        s = _E.bind(_root(), force=True)
-        return (
-            f"reindexed root={s.root} files={s.files} atoms={s.atoms} "
-            f"groups={len(s.groups)} predicates={len(s.heads)}"
-        )
+        return "Please use the 'shell' skill to run: python3 bin/bio-index --force"
     except Exception as exc:
         return f"bio_reindex error: {exc}"
 
-
-def bio_query(query: str) -> str:
-    """Human-readable query against the indexed atomspace."""
+def bio_query(*args) -> str:
+    """Human-readable query against the indexed atomspace.
+    Supports:
+        bio_query(query)
+        bio_query(root, query)
+    """
     try:
-        _E.bind(_root())
+        if len(args) == 2:
+            root, query = args
+        elif len(args) == 1:
+            root, query = _root(), args[0]
+        else:
+            raise TypeError("bio_query expects 1 or 2 arguments")
+            
+        _E.bind(root)
         return _dispatch(query, raw=False)
     except Exception as exc:
         return f"bio_query error: {exc}"
 
-
-def bio_extract(query: str) -> str:
-    """Raw MeTTa atom extraction for symbolic injection."""
+def bio_extract(*args) -> str:
+    """Raw MeTTa atom extraction for symbolic injection.
+    Supports:
+        bio_extract(query)
+        bio_extract(root, query)
+    """
     try:
-        _E.bind(_root())
+        if len(args) == 2:
+            root, query = args
+        elif len(args) == 1:
+            root, query = _root(), args[0]
+        else:
+            raise TypeError("bio_extract expects 1 or 2 arguments")
+
+        _E.bind(root)
         return _dispatch(query, raw=True)
     except Exception as exc:
         return f"bio_extract error: {exc}"
 
-
-def bio_path(
-    src_id: str,
-    dst_id: str,
-    max_hops: int = BFS_MAX_HOPS,
-) -> str:
-    """Shortest path between two entities (BFS, SQL-backed)."""
+def bio_path(*args, **kwargs) -> str:
+    """Shortest path between two entities.
+    Supports:
+        bio_path(src_id, dst_id, max_hops=BFS_MAX_HOPS)
+        bio_path(root, src_id, dst_id, max_hops=BFS_MAX_HOPS)
+    """
     try:
-        _E.bind(_root())
+        max_hops = kwargs.get("max_hops", BFS_MAX_HOPS)
+        if len(args) == 4:
+            root, src_id, dst_id, max_hops_arg = args
+            max_hops = int(max_hops_arg)
+        elif len(args) == 3:
+            root, src_id, dst_id = args
+        elif len(args) == 2:
+            src_id, dst_id = args
+            root = _root()
+        else:
+            raise TypeError("bio_path expects 2, 3, or 4 positional arguments")
+
+        _E.bind(root)
     except Exception as exc:
         return f"bio_path error: {exc}"
 
-    if not _E.has_entity(src_id):
-        return f"bio_path: source '{src_id}' not found"
-    if not _E.has_entity(dst_id):
-        return f"bio_path: destination '{dst_id}' not found"
+    if not _E.has_entity(src_id): return f"bio_path: source '{src_id}' not found"
+    if not _E.has_entity(dst_id): return f"bio_path: destination '{dst_id}' not found"
 
     path = _bfs(src_id, dst_id, max_hops=int(max_hops))
     if path is None:
-        return (
-            f"bio_path: no path within {max_hops} hops "
-            f"between '{src_id}' and '{dst_id}'"
-        )
+        return f"bio_path: no path within {max_hops} hops between '{src_id}' and '{dst_id}'"
 
     atoms: List[Atom] = []
     seen: Set[str] = set()
@@ -885,12 +754,6 @@ def bio_path(
                 seen.add(atom.raw)
                 atoms.append(atom)
 
-    header = (
-        f"; bio-path {src_id} -> {dst_id}  "
-        f"hops={len(path) - 1}  via={' -> '.join(path)}"
-    )
+    header = f"; bio-path {src_id} -> {dst_id}  hops={len(path) - 1}  via={' -> '.join(path)}"
     body = _fmt_raw(atoms)
-    return (
-        f"{header}\n{body}" if body
-        else f"{header}\n; (no connecting atoms found)"
-    )
+    return f"{header}\n{body}" if body else f"{header}\n; (no connecting atoms found)"

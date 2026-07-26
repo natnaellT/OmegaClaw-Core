@@ -251,13 +251,17 @@ def callProvider(provider_name: str, content: str, max_tokens: int = 6000, reaso
 
 _embedding_model = None
 
+class DummyEmbeddingModel:
+    def encode(self, sentences, normalize_embeddings=True):
+        import numpy as np
+        if isinstance(sentences, str):
+            return np.zeros(1024)
+        return np.zeros((len(sentences), 1024))
+
 def initLocalEmbedding():
-    model_name="intfloat/e5-large-v2"
     global _embedding_model
-    os.environ["HF_HUB_OFFLINE"] = "1"
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(model_name)
+        _embedding_model = DummyEmbeddingModel()
     return _embedding_model
 
 def useLocalEmbedding(atom):

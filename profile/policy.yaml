@@ -11,13 +11,11 @@ filesystem_policy:
   - /opt
   - /var/log
   - /sys/devices/system
-  - /PeTTa
+  - /home/natnael/PeTTa
   read_write:
-  - /PeTTa/repos/OmegaClaw-Core/memory
+  - /home/natnael/PeTTa/repos/OmegaClaw-Core/memory
   - /tmp
   - /dev/null
-  - /opt/huggingface
-  - /opt/sentence_transformers
   - /var/tmp
   - /dev/shm
 landlock:

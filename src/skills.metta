@@ -26,27 +26,27 @@
     "You can also use PLN:"
     "metta (|~ ((Implication (Inheritance $1 (IntSet Feathered))"
     "           (Inheritance $1 Bird)) (stv 1.0 0.9))"
-    "          ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"))
+    "          ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"
     ;BIO ATOMSPACE (BioCypher MeTTa exports):
-    "- Index BioCypher output folder (build or reuse cache): bio-index \"output_root\""
-    "- Force rebuild index from files: bio-reindex \"output_root\""
-    "- Query the indexed atomspace (human-readable): bio-query \"output_root\" \"command\""
+    "- Index BioCypher output folder (build or reuse cache): bio-index"
+    "- Force rebuild index from files: bio-reindex"
+    "- Query the indexed atomspace (human-readable): bio-query \"command\""
     "  Commands: stats | folders | predicates | folder <group> | predicate <name> | node <type> <id> | entity <id> | help"
-    "- Extract raw MeTTa atoms for symbolic injection: bio-extract \"output_root\" \"command\""
+    "- Extract raw MeTTa atoms for symbolic injection: bio-extract \"command\""
     "  Same commands as bio-query. Output is raw s-expressions suitable for: metta (|- <atoms> <rule>)"
-    "- Find shortest path between two entities (returns MeTTa edge atoms): bio-path \"output_root\" \"src_id\" \"dst_id\""
-    "  Example: bio-path \"/data/output\" \"ENSG00000125863\" \"CHEBI:15422\""
+    "- Find shortest path between two entities (returns MeTTa edge atoms): bio-path \"src_id\" \"dst_id\""
+    "  Example: bio-path \"ENSG00000125863\" \"CHEBI:15422\""
     "  Returns raw MeTTa atoms along the path, ready for symbolic reasoning."
     "Example neuro-symbolic reasoning chain:"
-    "  1. bio-extract \"/data/output\" \"node gene ENSG00000125863\""
+    "  1. bio-extract \"node gene ENSG00000125863\""
     "  2. Take the returned MeTTa atoms, inject into metta skill with an inference rule:"
     "     metta (|- (transcribes_to (gene ENSG00000125863) (transcript ENST0000353224))"
-    "               (Inheritance ENSG00000125863 protein-coding-gene))"
-
+    "               (Inheritance ENSG00000125863 protein-coding-gene))"))
 
 (= (read-file $file)
    (progn (translatePredicate (exists_file $file))
-          (translatePredicate (read_file_to_string $file $content ()))
+          (let $cmd (py-str ("cat '" $file "'"))
+               (translatePredicate (shell $cmd $content)))
           $content))
 
 (= (write-file $file $str)
@@ -69,21 +69,21 @@
 (= (technical-analysis $ticker)
    (py-call (agentverse.technical_analysis $ticker)))
 
-; Bio atomspace skills — all take an explicit output_root as first argument
-(= (bio-index $root)
-   (py-call (bio_graph.bio_index $root)))
+; Bio atomspace skills — path is resolved dynamically via BIOCYPHER_KG_PATH env variable
+(= (bio-index)
+   (py-call (bio_graph.bio_index)))
 
-(= (bio-reindex $root)
-   (py-call (bio_graph.bio_reindex $root)))
+(= (bio-reindex)
+   (py-call (bio_graph.bio_reindex)))
 
-(= (bio-query $root $q)
-   (py-call (bio_graph.bio_query $root $q)))
+(= (bio-query $q)
+   (py-call (bio_graph.bio_query $q)))
 
-(= (bio-extract $root $q)
-   (py-call (bio_graph.bio_extract $root $q)))
+(= (bio-extract $q)
+   (py-call (bio_graph.bio_extract $q)))
 
-(= (bio-path $root $src $dst)
-   (py-call (bio_graph.bio_path $root $src $dst)))
+(= (bio-path $src $dst)
+   (py-call (bio_graph.bio_path $src $dst)))
 
 !(import_prolog_functions_from_file (library OmegaClaw-Core ./src/skills.pl) (shell first_char gc read_file_tail))
 

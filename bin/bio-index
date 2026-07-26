@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Standalone BioCypher Knowledge Graph Indexer.
+
+Run this script directly to build or update the .bioclaw.db SQLite index.
+Usage:
+    python3 bin/bio-index [path/to/biocypher/output] [--force]
+"""
+import sys
+import os
+
+# Add src to pythonpath so we can import bio_graph
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+
+import bio_graph
+
+def main():
+    force = '--force' in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    
+    root = args[0] if args else os.environ.get("BIOCYPHER_KG_PATH", "./data")
+    
+    print(f"Indexing BioCypher output in: {root}")
+    if force:
+        print("Forcing full rebuild...")
+        
+    try:
+        stats = bio_graph.build_index(root, force=force)
+        print("Index successfully built!")
+        print(f"  Files: {stats.files}")
+        print(f"  Atoms: {stats.atoms}")
+        print(f"  Groups: {len(stats.groups)}")
+        print(f"  Predicates: {len(stats.heads)}")
+    except Exception as e:
+        print(f"Error building index: {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
